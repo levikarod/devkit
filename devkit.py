@@ -8,6 +8,7 @@ import shlex
 import ssl
 import subprocess
 import sys
+import threading
 import time
 import tomllib
 import urllib.error
@@ -23,6 +24,11 @@ NAME_PATTERN = re.compile(r'^[a-z0-9][a-z0-9-]{0,29}$')
 ENV_LINE = re.compile(r'^([A-Za-z_][A-Za-z0-9_]*)=(.*)$')
 SECRETS_FILE = '~/.devkit-secrets'
 NOTE_FILE = 'CLAUDE.local.md'
+CLAUDE_HOME = Path('~/.claude').expanduser()
+MIRRORED = ('plugins', 'skills', 'settings.json', 'CLAUDE.md')
+ACCOUNT_SERVER_PREFIX = 'claude.ai '
+MCP_LINE = re.compile(r'^(?P<name>.+?): .* - (?P<mark>[✔✘!⊘])')
+MCP_STATUS = {'✔': 'connected', '✘': 'failed', '!': 'needs login', '⊘': 'disabled'}
 
 
 class DevkitError(Exception):
@@ -139,6 +145,27 @@ def static_network(current, vmid, network):
     if network.get('gateway'):
         parts.append(f"gw={network['gateway']}")
     return ','.join(parts)
+
+
+def parse_mcp_list(text):
+    servers = {}
+    for line in text.splitlines():
+        match = MCP_LINE.match(line.strip())
+        if match:
+            servers[match.group('name')] = MCP_STATUS[match.group('mark')]
+    return servers
+
+
+def compare_tool_servers(here, inside):
+    working_here = {
+        name for name, status in here.items()
+        if status == 'connected' and not name.startswith(ACCOUNT_SERVER_PREFIX)
+    }
+    missing = sorted(
+        (name, inside.get(name, 'absent')) for name in working_here if inside.get(name) != 'connected'
+    )
+    extra = sorted(name for name, status in inside.items() if status == 'connected' and name not in working_here)
+    return len(working_here), missing, extra
 
 
 def encode_description(branch):
@@ -343,7 +370,7 @@ class Devkit:
     def remote(self, vmid):
         return Remote(self.proxmox.address(vmid), self.user, self.key)
 
-    def create(self, name, branch):
+    def create(self, name, branch, check=True):
         validate_name(name)
         branch = branch or name
         LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -352,9 +379,9 @@ class Devkit:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 raise DevkitError('another create is running, try again in a moment') from None
-            self._create(name, branch)
+            self._create(name, branch, check)
 
-    def _create(self, name, branch):
+    def _create(self, name, branch, check=True):
         existing = self.proxmox.environments()
         if any(c['name'] == ENV_PREFIX + name for c in existing):
             raise DevkitError(f"environment '{name}' already exists")
@@ -364,6 +391,10 @@ class Devkit:
             raise DevkitError(f'limit of {limit} environments reached ({names}); destroy one first')
         vmid = self.proxmox.next_id()
         started = time.time()
+        here = {}
+        probe = threading.Thread(target=lambda: here.update(self._tool_servers_here()), daemon=True)
+        if check:
+            probe.start()
         step(f'cloning template into container {vmid}')
         self.proxmox.clone(
             self.server['proxmox']['template'], vmid, ENV_PREFIX + name,
@@ -382,6 +413,9 @@ class Devkit:
             self._checkout(remote, branch)
             step('pushing settings')
             self._push_settings(remote)
+            if self.server.get('claude', {}).get('mirror', True):
+                step('mirroring the Claude setup')
+                self._mirror_claude(remote)
         except BaseException:
             step('create failed, removing the half-made environment')
             self._remove(vmid)
@@ -392,6 +426,11 @@ class Devkit:
         print(f'  branch   {branch}')
         print(f'  shell    devkit ssh {name}')
         print(f'  claude   devkit claude {name}')
+        if check:
+            print()
+            step('checking tool servers')
+            probe.join(timeout=120)
+            self._report_tool_servers(here, self._tool_servers_inside(remote))
 
     def _checkout(self, remote, branch):
         repo = self.project['repo']
@@ -447,6 +486,7 @@ git log --oneline -1
             'data["hasCompletedOnboarding"] = True\n'
             f'project = data.setdefault("projects", {{}}).setdefault({self.workdir!r}, {{}})\n'
             'project["hasTrustDialogAccepted"] = True\n'
+            'project["enableAllProjectMcpServers"] = True\n'
             f'data.setdefault("mcpServers", {{}}).update(json.loads({json.dumps(servers)!r}))\n'
             'json.dump(data, open(path, "w"))\n'
         )
@@ -454,6 +494,67 @@ git log --oneline -1
         note = self.project.get('note')
         if note:
             remote.run(f'cat > {shlex.quote(self.workdir + "/" + NOTE_FILE)}', stdin=note.strip() + '\n')
+
+    def _mirror_claude(self, remote):
+        items = [item for item in MIRRORED if (CLAUDE_HOME / item).exists()]
+        if items:
+            pack = subprocess.Popen(
+                ['tar', '-C', str(CLAUDE_HOME), '-chf', '-', *items],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            )
+            unpack = subprocess.run(
+                remote.command('mkdir -p ~/.claude && tar -C ~/.claude -xf -'),
+                stdin=pack.stdout, capture_output=True, text=True,
+            )
+            pack.wait()
+            if unpack.returncode != 0:
+                raise DevkitError(f'mirroring the Claude setup failed: {unpack.stderr.strip()[-200:]}')
+        rewrite = (
+            'import glob, os\n'
+            f'old = {str(Path.home())!r}\n'
+            'new = os.path.expanduser("~")\n'
+            'base = os.path.expanduser("~/.claude")\n'
+            'for path in glob.glob(base + "/plugins/*.json") + [base + "/settings.json"]:\n'
+            '    if os.path.isfile(path):\n'
+            '        text = open(path).read()\n'
+            '        if old in text:\n'
+            '            open(path, "w").write(text.replace(old, new))\n'
+        )
+        remote.run('python3 -', stdin=rewrite)
+
+    def _tool_servers_here(self):
+        try:
+            result = subprocess.run(
+                ['claude', 'mcp', 'list'], cwd=self.project_root, capture_output=True, text=True, timeout=110,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return {}
+        return parse_mcp_list(result.stdout)
+
+    def _tool_servers_inside(self, remote):
+        script = (
+            f'[ -f {SECRETS_FILE} ] && . {SECRETS_FILE}; export PATH="$HOME/.local/bin:$PATH"; '
+            f'cd {shlex.quote(self.workdir)} && timeout 170 claude mcp list'
+        )
+        result = subprocess.run(remote.command(script), capture_output=True, text=True)
+        return parse_mcp_list(result.stdout)
+
+    def _report_tool_servers(self, here, inside):
+        if not here:
+            step('could not read the tool server list on this machine; nothing to compare')
+            return
+        total, missing, extra = compare_tool_servers(here, inside)
+        step(f'{total - len(missing)} of {total} tool servers that work here also work inside')
+        for name, status in missing:
+            step(f'  NOT WORKING inside: {name} ({status})')
+        for name in extra:
+            step(f'  only inside: {name}')
+
+    def check(self, name):
+        container = self.proxmox.find(validate_name(name))
+        step('checking tool servers')
+        here = self._tool_servers_here()
+        self._report_tool_servers(here, self._tool_servers_inside(self.remote(container['vmid'])))
 
     def _always_dropped(self):
         secrets = self.server['secrets']
@@ -547,6 +648,9 @@ def build_parser():
     create = commands.add_parser('create', help='create an environment')
     create.add_argument('name')
     create.add_argument('branch', nargs='?', help='defaults to the name')
+    create.add_argument('--no-check', action='store_true', help='skip the tool server comparison')
+    check = commands.add_parser('check', help='compare tool servers here and inside an environment')
+    check.add_argument('name')
     commands.add_parser('list', help='list environments')
     shell = commands.add_parser('ssh', help='open a shell, or run a command after --')
     shell.add_argument('name')
@@ -569,7 +673,9 @@ def main(argv=None):
     try:
         devkit = Devkit(Path(arguments.project_dir).resolve())
         if arguments.command == 'create':
-            devkit.create(arguments.name, arguments.branch)
+            devkit.create(arguments.name, arguments.branch, check=not arguments.no_check)
+        elif arguments.command == 'check':
+            devkit.check(arguments.name)
         elif arguments.command == 'list':
             devkit.list()
         elif arguments.command == 'ssh':

@@ -166,6 +166,44 @@ class TestStaticNetwork(unittest.TestCase):
             devkit.static_network(self.CURRENT, 300, self.NETWORK)
 
 
+class TestToolServerParity(unittest.TestCase):
+
+    HERE = """Checking MCP server health…
+claude.ai Gmail: https://gmailmcp.googleapis.com/mcp/v1 - ✔ Connected
+plugin:playwright:playwright: npx @playwright/mcp@latest - ✔ Connected
+plugin:cloudflare:cloudflare-api: https://mcp.cloudflare.com/mcp (HTTP) - ! Needs authentication
+ui5-mcp-server: npx -y @ui5/mcp-server - ✘ Failed to connect — CONNECTION_CLOSED: Connection closed
+mercadopago: https://mcp.mercadopago.com/mcp (HTTP) - ⊘ Disabled for this project (re-enable via /mcp)
+mysql-mcp-server: bash scripts/mcp_mysql.sh - ✔ Connected
+"""
+
+    def test_statuses_are_parsed(self):
+        self.assertEqual(devkit.parse_mcp_list(self.HERE), {
+            'claude.ai Gmail': 'connected',
+            'plugin:playwright:playwright': 'connected',
+            'plugin:cloudflare:cloudflare-api': 'needs login',
+            'ui5-mcp-server': 'failed',
+            'mercadopago': 'disabled',
+            'mysql-mcp-server': 'connected',
+        })
+
+    def test_only_servers_working_here_are_expected_inside(self):
+        here = devkit.parse_mcp_list(self.HERE)
+        inside = {'plugin:playwright:playwright': 'failed', 'mysql-mcp-server': 'connected', 'posthog': 'connected'}
+        total, missing, extra = devkit.compare_tool_servers(here, inside)
+        self.assertEqual(total, 2)
+        self.assertEqual(missing, [('plugin:playwright:playwright', 'failed')])
+        self.assertEqual(extra, ['posthog'])
+
+    def test_a_server_absent_inside_is_reported(self):
+        total, missing, _ = devkit.compare_tool_servers({'a': 'connected'}, {})
+        self.assertEqual(missing, [('a', 'absent')])
+
+    def test_account_connectors_are_never_expected_inside(self):
+        total, missing, _ = devkit.compare_tool_servers({'claude.ai Gmail': 'connected'}, {})
+        self.assertEqual((total, missing), (0, []))
+
+
 class TestNames(unittest.TestCase):
 
     def test_accepts_branch_like_names(self):

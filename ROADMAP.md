@@ -43,6 +43,20 @@
 - Single Python file, standard library only
 - State read from Proxmox, no state file
 
+## Version 0.1.1: Claude setup that just works
+
+- Dev machine's Claude setup mirrored at create: plugins, skills, settings, global instructions
+- No list of plugins or tool servers anywhere
+- Stored logins never mirrored
+- General runtimes in the template: Node, Python with uv, Docker
+- Google Chrome in the template, so browser tools work with their default settings
+- Parity check at create: tool servers connected here compared with inside
+- `check <name>` to repeat the comparison later
+- `create --no-check` to skip it
+- Account connectors (claude.ai) never expected inside
+- Root for the inside user, for one-off fixes
+- Project tool servers pre-approved inside
+
 ## Version 0.2: comfortable
 
 ### Safety
@@ -60,16 +74,11 @@
 - Skills as thin wrappers over the command-line tool
 - Same limits for Claude and for people
 - Remote control on by default, session named after the environment
-- Dev machine's Claude setup mirrored at create: plugins, skills, settings, global instructions
-- No list of plugins or tool servers anywhere
-- Stored logins never mirrored
-- General runtimes in the template: Node, Python with uv, Docker, one browser with its libraries
-- Parity check at create: tool servers connected here compared with inside
-- Root for the inside user, for one-off fixes
 - Keyed tool servers kept explicit in the app config
 - Dedicated PostHog key for environments, with the scopes its tool server asks for
 - Other login-based tool servers left out: MercadoLibre, MercadoPago, Cloudflare
-- Transcripts and project memory copied back before destroy
+- Deeper check than "connected": one real call per tool server
+- Project memory mirrored in, transcripts and memory copied back before destroy
 
 ### Template
 - `template build` command

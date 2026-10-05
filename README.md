@@ -17,6 +17,7 @@ devkit ssh fix-orders               # shell in the project folder
 devkit ssh fix-orders -- make test  # run one command and return
 devkit claude fix-orders            # Claude Code in the project folder
 devkit claude fix-orders -- -p "summarise the last commit"
+devkit check fix-orders             # compare tool servers here and inside
 devkit destroy fix-orders           # asks first; -y skips the question
 ```
 
@@ -31,6 +32,8 @@ Names are lowercase letters, digits and dashes, at most 30 characters.
 5. Pushes the Claude token and tool server keys to a separate protected file.
 6. Registers the project's tool servers for Claude and marks the workspace trusted.
 7. Pushes the project's note for Claude as `CLAUDE.local.md`.
+8. Mirrors this machine's Claude setup: plugins, skills, settings and global instructions. Stored logins are never copied.
+9. Compares tool servers: every one that connects on this machine should connect inside. Differences are printed. `--no-check` skips this.
 
 If a step fails, the half-made environment is removed.
 
@@ -42,6 +45,14 @@ If a step fails, the half-made environment is removed.
 - Only branches pushed to the remote reach an environment.
 - `git push` works from `devkit ssh` and `devkit claude` sessions, through SSH agent forwarding.
 - `destroy` does not check for unpushed work.
+- The user inside has `sudo`.
+
+### Tool servers inside
+
+- Nothing lists plugins or tool servers. Add a plugin on this machine and the next environment has it.
+- Servers that need a browser login show "needs login" inside. Give them a key through `[[tool_servers]]`, or leave them out.
+- A server can depend on a running container (one that reads a token from the backend, for example). It fails the check until that container is started; run `devkit check <name>` again afterwards.
+- "Connected" means the server started, not that every tool in it works.
 
 ## Setup
 
@@ -61,7 +72,7 @@ Python 3.11 or newer. No dependencies.
 host = "192.168.1.50"
 node = "dev"
 pool = "devkit"
-template = 106
+template = 107
 
 [limits]
 max_environments = 3
@@ -78,6 +89,9 @@ claude_token_key = "CLAUDE_CODE_OAUTH_TOKEN"
 
 [variables]
 shared_host = "192.168.1.102"       # usable as {shared_host} in any .devkit.toml
+
+[claude]
+mirror = true                       # default; false keeps this machine's Claude setup out
 
 [network]                           # optional; without it environments use DHCP
 address = "192.168.1.{vmid}/24"     # container 104 gets 192.168.1.104
