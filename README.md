@@ -1,0 +1,131 @@
+# devkit
+
+Disposable development environments. Each one is a Proxmox container cloned from a template, with Docker and Claude Code inside, your branch checked out, and the app's settings pushed in. Create one in about ten seconds, work in it, destroy it.
+
+- What is planned: [ROADMAP.md](ROADMAP.md)
+- How the template is built: [TEMPLATE.md](TEMPLATE.md)
+
+## Usage
+
+Run from inside a project that has a `.devkit.toml` (or pass `-C <project folder>`).
+
+```bash
+devkit create fix-orders            # branch fix-orders; cut from the base branch if it is new
+devkit create review feature/x      # environment "review" on an existing branch
+devkit list                         # name, branch, address, state, memory, uptime
+devkit ssh fix-orders               # shell in the project folder
+devkit ssh fix-orders -- make test  # run one command and return
+devkit claude fix-orders            # Claude Code in the project folder
+devkit claude fix-orders -- -p "summarise the last commit"
+devkit destroy fix-orders           # asks first; -y skips the question
+```
+
+Names are lowercase letters, digits and dashes, at most 30 characters.
+
+### What `create` does
+
+1. Refuses if the environment cap is reached or another create is running.
+2. Clones the template, starts it, waits for SSH.
+3. Fetches the branch from the remote inside the environment.
+4. Pushes the app's settings file, rewritten as the project config says.
+5. Pushes the Claude token and tool server keys to a separate protected file.
+6. Registers the project's tool servers for Claude and marks the workspace trusted.
+7. Pushes the project's note for Claude as `CLAUDE.local.md`.
+
+If a step fails, the half-made environment is removed.
+
+### Working inside
+
+- No containers are started for you. Start what the task needs, with `--no-deps`:
+  `docker compose up -d --no-deps --no-build <service>`
+- The project's `CLAUDE.local.md` says which services are shared and which must never be started.
+- Only branches pushed to the remote reach an environment.
+- `git push` works from `devkit ssh` and `devkit claude` sessions, through SSH agent forwarding.
+- `destroy` does not check for unpushed work.
+
+## Setup
+
+### Install
+
+```bash
+ln -s ~/devkit/devkit.py ~/.local/bin/devkit
+ln -s ~/devkit/skills/setting-up-devkit ~/.claude/skills/setting-up-devkit
+```
+
+Python 3.11 or newer. No dependencies.
+
+### Server config: `~/.config/devkit/config.toml`
+
+```toml
+[proxmox]
+host = "192.168.1.50"
+node = "dev"
+pool = "devkit"
+template = 106
+
+[limits]
+max_environments = 3
+
+[ssh]
+user = "dev"
+key = "~/.ssh/devkit_ed25519"       # reaches environments
+github_key = "~/.ssh/id_ed25519"    # lent to environments through agent forwarding
+
+[secrets]
+file = "~/droppo-v2/.env"           # where secret values are looked up
+proxmox_token_key = "PVEAPIToken"
+claude_token_key = "CLAUDE_CODE_OAUTH_TOKEN"
+
+[variables]
+shared_host = "192.168.1.102"       # usable as {shared_host} in any .devkit.toml
+
+[network]                           # optional; without it environments use DHCP
+address = "192.168.1.{vmid}/24"     # container 104 gets 192.168.1.104
+gateway = "192.168.1.1"
+```
+
+- The Proxmox token needs `PVEVMAdmin` on the pool, `PVEDatastoreUser` on the container storage, `PVESDNUser` on the network zone and `PVEAuditor` on the node.
+- The Claude token comes from `claude setup-token`.
+- With `[network]`, keep that address range out of the router's DHCP pool.
+
+### Project config: `<repo>/.devkit.toml`
+
+Ask Claude to use the `setting-up-devkit` skill, or write it by hand:
+
+```toml
+repo = "git@github.com:owner/app.git"
+base_branch = "development"
+workdir = "/home/dev/app"           # where the repo sits inside the template
+
+note = """
+Text for the Claude session inside: shared services, how to run tests, what never to start.
+"""
+
+[settings]
+source = ".env"                     # on this machine
+target = ".env"                     # inside workdir
+drop = ["TOOLING_ONLY_TOKEN"]       # never pushed
+
+[settings.force]                    # set to exactly this, added if missing
+MYSQL_HOST = "{shared_host}"
+EMAIL_SEND_ENABLED = "false"
+
+[settings.replace]                  # plain-text replace inside every other value
+"@mongodb:" = "@{shared_host}:"
+
+[[tool_servers]]                    # only services that take a key in a header
+name = "posthog"
+url = "https://mcp.posthog.com/mcp"
+header = "Authorization: Bearer {secret}"
+secret_key = "POSTHOG_ENV_API_KEY"  # looked up in the secrets file
+```
+
+- devkit always strips its own secrets from the pushed file: the Proxmox token, the Claude token and every tool server key.
+- A tool server whose key is missing is skipped with a message.
+- A `replace` rule that matches nothing prints a warning.
+
+## Tests
+
+```bash
+cd ~/devkit && PYTHONPATH=. python3 -m unittest tests.test_devkit
+```
