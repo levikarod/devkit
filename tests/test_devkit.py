@@ -376,3 +376,13 @@ class TestShip(unittest.TestCase):
     def test_the_current_branch_is_pushed(self):
         script = devkit.ship_script('/home/dev/app', 'm', 'n', 'e@x')
         self.assertIn('-u origin HEAD', script)
+
+
+class TestListData(unittest.TestCase):
+
+    def test_an_environment_is_named_without_the_prefix(self):
+        container = {'name': 'env-gt-10071', 'status': 'stopped'}
+        self.assertEqual(
+            devkit.environment_summary(container, 'fix/glitchtip-10071'),
+            {'name': 'gt-10071', 'branch': 'fix/glitchtip-10071', 'state': 'stopped'},
+        )

@@ -270,6 +270,10 @@ def report_data(run_id, state, result):
     }
 
 
+def environment_summary(container, branch):
+    return {'name': container['name'][len(ENV_PREFIX):], 'branch': branch, 'state': container['status']}
+
+
 def running_names(environments):
     return [c['name'][len(ENV_PREFIX):] for c in environments if c['status'] == 'running']
 
@@ -816,15 +820,21 @@ git log --oneline -1
         )
         return keys
 
-    def list(self):
+    def _branch_of(self, container):
+        return decode_description(self.proxmox.config(container['vmid']).get('description'))
+
+    def list(self, as_json=False):
         environments = self.proxmox.environments()
+        if as_json:
+            print(json.dumps([environment_summary(c, self._branch_of(c)) for c in environments]))
+            return
         if not environments:
             print('no environments')
             return
         rows = [('NAME', 'BRANCH', 'ADDRESS', 'STATE', 'MEMORY', 'UP')]
         for container in environments:
             running = container['status'] == 'running'
-            branch = decode_description(self.proxmox.config(container['vmid']).get('description'))
+            branch = self._branch_of(container)
             address = self.proxmox.address(container['vmid'], timeout=3) if running else '-'
             memory = f"{container.get('mem', 0) / 2**20:.0f}/{container['maxmem'] / 2**20:.0f} MB"
             rows.append((
@@ -994,7 +1004,8 @@ def build_parser():
     create.add_argument('--no-check', action='store_true', help='skip the tool server comparison')
     check = commands.add_parser('check', help='compare tool servers here and inside an environment')
     check.add_argument('name')
-    commands.add_parser('list', help='list environments')
+    listing = commands.add_parser('list', help='list environments')
+    listing.add_argument('--json', dest='as_json', action='store_true', help='name, branch and state for scripts')
     shell = commands.add_parser('ssh', help='open a shell, or run a command after --')
     shell.add_argument('name')
     shell.add_argument('remote_command', nargs=argparse.REMAINDER)
@@ -1040,7 +1051,7 @@ def main(argv=None):
         elif arguments.command == 'check':
             devkit.check(arguments.name)
         elif arguments.command == 'list':
-            devkit.list()
+            devkit.list(as_json=arguments.as_json)
         elif arguments.command == 'ssh':
             return devkit.ssh(arguments.name, strip_separator(arguments.remote_command))
         elif arguments.command == 'claude':

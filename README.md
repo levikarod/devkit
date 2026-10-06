@@ -13,6 +13,7 @@ Run from inside a project that has a `.devkit.toml` (or pass `-C <project folder
 devkit create fix-orders            # branch fix-orders; cut from the base branch if it is new
 devkit create review feature/x      # environment "review" on an existing branch
 devkit list                         # name, branch, address, state, memory, uptime
+devkit list --json                  # name, branch and state for scripts
 devkit ssh fix-orders               # shell in the project folder
 devkit ssh fix-orders -- make test  # run one command and return
 devkit claude fix-orders            # Claude Code in the project folder
