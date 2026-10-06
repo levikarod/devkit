@@ -19,7 +19,10 @@ devkit claude fix-orders            # Claude Code in the project folder
 devkit claude fix-orders -- -p "summarise the last commit"
 devkit code fix-orders              # open the environment in VS Code over Remote-SSH
 devkit check fix-orders             # compare tool servers here and inside
-devkit destroy fix-orders           # asks first; -y skips the question
+devkit stop fix-orders              # free its memory, keep its files
+devkit start fix-orders             # bring it back; containers inside are not restarted
+devkit destroy fix-orders           # refuses if work inside would be lost; asks first
+devkit destroy --all                # every environment that has nothing to lose
 ```
 
 Names are lowercase letters, digits and dashes, at most 30 characters.
@@ -45,7 +48,8 @@ If a step fails, the half-made environment is removed.
 - The project's `CLAUDE.local.md` says which services are shared and which must never be started.
 - Only branches pushed to the remote reach an environment.
 - `git push` works from `devkit ssh` and `devkit claude` sessions, through SSH agent forwarding.
-- `destroy` does not check for unpushed work.
+- `destroy` refuses when the checkout has uncommitted files or unpushed commits, and when the environment is stopped and cannot be checked. `--force` overrides; `-y` only skips the question.
+- Remote control and cross-session messaging do not work inside: both need a full claude.ai login, and environments log in with a long-lived token that can only make model requests.
 - The user inside has `sudo`.
 
 ### Tool servers inside
@@ -77,6 +81,7 @@ template = 107
 
 [limits]
 max_environments = 3
+min_free_memory_mb = 2048           # optional: create and start refuse below this
 
 [ssh]
 user = "dev"
@@ -94,6 +99,7 @@ shared_host = "192.168.1.102"       # usable as {shared_host} in any .devkit.tom
 
 [claude]
 mirror = true                       # default; false keeps this machine's Claude setup out
+remote_control = false              # default; only useful once an environment has a full claude.ai login
 
 [network]                           # optional; without it environments use DHCP
 address = "192.168.1.{vmid}/24"     # container 104 gets 192.168.1.104

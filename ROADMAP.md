@@ -66,20 +66,22 @@
 ## Version 0.2: comfortable
 
 ### Safety
-- Unpushed-work check before destroy
-- Memory check on the server before create
+- Unpushed-work check before destroy, `--force` to override
+- Server memory check before create and start
 - `destroy --all`
-- Stop and resume without destroying
+- `stop` and `start` without destroying
 - Memory view, heaviest first
 - Owner recorded per environment: person or Claude session
-- Hard guard against starting the scheduler or database services inside
 - Doctor command: Proxmox access, memory, template, network
 
 ### Claude
 - Claude Code plugin with skills: create, list, destroy
 - Skills as thin wrappers over the command-line tool
 - Same limits for Claude and for people
-- Remote control on by default, session named after the environment
+- `login <name>`: full claude.ai login inside one environment, done once by hand in a browser
+- Remote control and cross-session messaging for environments that have that login
+- Coordinator here, workers inside: tasks handed over SSH, final report returned
+- Workers run detached, so a dropped connection does not kill a task
 - Keyed tool servers kept explicit in the app config
 - Dedicated PostHog key for environments, with the scopes its tool server asks for
 - Other login-based tool servers left out: MercadoLibre, MercadoPago, Cloudflare

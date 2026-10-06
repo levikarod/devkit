@@ -168,6 +168,37 @@ def compare_tool_servers(here, inside):
     return len(working_here), missing, extra
 
 
+WORK_PROBE = (
+    'echo "## dirty"; git status --porcelain; '
+    'echo "## unpushed"; git log --oneline --branches --not --remotes'
+)
+
+
+def parse_work(text):
+    sections = {'dirty': [], 'unpushed': []}
+    current = None
+    for line in text.splitlines():
+        if line.startswith('## '):
+            current = line[3:].strip()
+        elif line.strip() and current in sections:
+            sections[current].append(line.rstrip())
+    return sections
+
+
+def describe_work(work):
+    parts = []
+    if work['unpushed']:
+        parts.append(f"{len(work['unpushed'])} unpushed commit(s)")
+    if work['dirty']:
+        parts.append(f"{len(work['dirty'])} uncommitted file(s)")
+    return ' and '.join(parts)
+
+
+def free_memory_mb(node_status):
+    memory = node_status['memory']
+    return (memory['total'] - memory['used']) // 2**20
+
+
 def public_keys(text):
     keys = []
     for line in text.splitlines():
@@ -291,6 +322,12 @@ class Proxmox:
     def delete(self, vmid):
         self.wait(self.call('DELETE', f'/nodes/{self.node}/lxc/{vmid}?purge=1'))
 
+    def shutdown(self, vmid):
+        self.wait(self.call('POST', f'/nodes/{self.node}/lxc/{vmid}/status/shutdown'))
+
+    def node_status(self):
+        return self.call('GET', f'/nodes/{self.node}/status')
+
     def next_id(self):
         return int(self.call('GET', '/cluster/nextid'))
 
@@ -402,6 +439,7 @@ class Devkit:
         if len(existing) >= limit:
             names = ', '.join(c['name'][len(ENV_PREFIX):] for c in existing)
             raise DevkitError(f'limit of {limit} environments reached ({names}); destroy one first')
+        self._require_memory()
         vmid = self.proxmox.next_id()
         started = time.time()
         here = {}
@@ -652,6 +690,8 @@ git log --oneline -1
     def claude(self, name, arguments):
         container = self.proxmox.find(validate_name(name))
         remote = self.remote(container['vmid'])
+        if not arguments and self.server.get('claude', {}).get('remote_control', False):
+            arguments = ['--remote-control', name]
         extra = ' '.join(shlex.quote(part) for part in arguments)
         script = (
             f'[ -f {SECRETS_FILE} ] && . {SECRETS_FILE}; export PATH="$HOME/.local/bin:$PATH"; '
@@ -662,15 +702,94 @@ git log --oneline -1
                 remote.command(script, forward=True, tty=sys.stdin.isatty()), env=env,
             ).returncode
 
-    def destroy(self, name, assume_yes):
+    def _require_memory(self):
+        needed = self.server['limits'].get('min_free_memory_mb')
+        if not needed:
+            return
+        free = free_memory_mb(self.proxmox.node_status())
+        if free < needed:
+            raise DevkitError(
+                f'the server has {free} MB of memory free and {needed} MB is required; '
+                'stop or destroy an environment first'
+            )
+
+    def _work_inside(self, container):
+        if container['status'] != 'running':
+            return None
+        remote = self.remote(container['vmid'])
+        result = subprocess.run(
+            remote.command(f'cd {shlex.quote(self.workdir)} && {WORK_PROBE}'), capture_output=True, text=True,
+        )
+        return parse_work(result.stdout) if result.returncode == 0 else None
+
+    def _may_destroy(self, name, container, force):
+        if force:
+            return True
+        work = self._work_inside(container)
+        if work is None:
+            print(f"'{name}' kept: it is not running, so its work cannot be checked; "
+                  f'start it, or pass --force')
+            return False
+        summary = describe_work(work)
+        if summary:
+            print(f"'{name}' kept: {summary} would be lost")
+            for line in (work['unpushed'] + work['dirty'])[:8]:
+                print(f'    {line}')
+            print('  push or commit the work, or pass --force')
+            return False
+        return True
+
+    def destroy(self, name, assume_yes, force=False):
         container = self.proxmox.find(validate_name(name))
+        if not self._may_destroy(name, container, force):
+            return 1
         if not assume_yes:
-            answer = input(f"destroy '{name}'? unpushed work inside is lost [y/N] ")
+            answer = input(f"destroy '{name}'? [y/N] ")
             if answer.strip().lower() not in ('y', 'yes'):
                 print('kept')
-                return
+                return 0
         self._remove(container['vmid'], running=container['status'] == 'running')
         print(f"'{name}' destroyed")
+        return 0
+
+    def destroy_all(self, assume_yes, force=False):
+        environments = self.proxmox.environments()
+        if not environments:
+            print('no environments')
+            return 0
+        names = [container['name'][len(ENV_PREFIX):] for container in environments]
+        if not assume_yes:
+            answer = input(f"destroy {len(names)} environment(s): {', '.join(names)}? [y/N] ")
+            if answer.strip().lower() not in ('y', 'yes'):
+                print('kept')
+                return 0
+        kept = 0
+        for name, container in zip(names, environments):
+            if self._may_destroy(name, container, force):
+                self._remove(container['vmid'], running=container['status'] == 'running')
+                print(f"'{name}' destroyed")
+            else:
+                kept += 1
+        return 1 if kept else 0
+
+    def stop(self, name):
+        container = self.proxmox.find(validate_name(name))
+        if container['status'] != 'running':
+            print(f"'{name}' is already stopped")
+            return
+        self.proxmox.shutdown(container['vmid'])
+        print(f"'{name}' stopped; its files are kept and its memory is freed")
+
+    def start(self, name):
+        container = self.proxmox.find(validate_name(name))
+        if container['status'] == 'running':
+            print(f"'{name}' is already running")
+            return
+        self._require_memory()
+        self.proxmox.start(container['vmid'])
+        remote = self.remote(container['vmid'])
+        remote.wait()
+        print(f"'{name}' running at {remote.target.split('@')[1]}; containers inside are not restarted")
 
     def _remove(self, vmid, running=True):
         if running:
@@ -713,8 +832,14 @@ def build_parser():
     code = commands.add_parser('code', help='open an environment in VS Code over Remote-SSH')
     code.add_argument('name')
     destroy = commands.add_parser('destroy', help='destroy an environment')
-    destroy.add_argument('name')
+    destroy.add_argument('name', nargs='?')
+    destroy.add_argument('--all', action='store_true', help='destroy every environment')
     destroy.add_argument('-y', '--yes', action='store_true', help='skip the confirmation prompt')
+    destroy.add_argument('--force', action='store_true', help='destroy even with unpushed or unchecked work')
+    stop = commands.add_parser('stop', help='stop an environment, keeping its files')
+    stop.add_argument('name')
+    start = commands.add_parser('start', help='start a stopped environment')
+    start.add_argument('name')
     return parser
 
 
@@ -739,7 +864,15 @@ def main(argv=None):
         elif arguments.command == 'code':
             devkit.code(arguments.name)
         elif arguments.command == 'destroy':
-            devkit.destroy(arguments.name, arguments.yes)
+            if arguments.all == bool(arguments.name):
+                raise DevkitError('give an environment name, or --all')
+            if arguments.all:
+                return devkit.destroy_all(arguments.yes, arguments.force)
+            return devkit.destroy(arguments.name, arguments.yes, arguments.force)
+        elif arguments.command == 'stop':
+            devkit.stop(arguments.name)
+        elif arguments.command == 'start':
+            devkit.start(arguments.name)
     except DevkitError as error:
         print(f'devkit: {error}', file=sys.stderr)
         return 1

@@ -217,6 +217,29 @@ class TestEditorAccess(unittest.TestCase):
         )
 
 
+class TestWorkCheck(unittest.TestCase):
+
+    def test_a_clean_pushed_checkout_has_nothing_to_lose(self):
+        work = devkit.parse_work('## dirty\n## unpushed\n')
+        self.assertEqual(work, {'dirty': [], 'unpushed': []})
+        self.assertEqual(devkit.describe_work(work), '')
+
+    def test_uncommitted_and_unpushed_work_are_both_counted(self):
+        work = devkit.parse_work(
+            '## dirty\n M app/a.py\n?? tests/b.py\n## unpushed\n8187534 fix: something\n'
+        )
+        self.assertEqual(work['dirty'], [' M app/a.py', '?? tests/b.py'])
+        self.assertEqual(work['unpushed'], ['8187534 fix: something'])
+        self.assertEqual(devkit.describe_work(work), '1 unpushed commit(s) and 2 uncommitted file(s)')
+
+
+class TestMemory(unittest.TestCase):
+
+    def test_free_memory_is_total_minus_used(self):
+        status = {'memory': {'total': 24 * 2**30, 'used': 18 * 2**30, 'free': 1 * 2**30}}
+        self.assertEqual(devkit.free_memory_mb(status), 6 * 1024)
+
+
 class TestNames(unittest.TestCase):
 
     def test_accepts_branch_like_names(self):
