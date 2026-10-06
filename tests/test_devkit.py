@@ -240,6 +240,38 @@ class TestMemory(unittest.TestCase):
         self.assertEqual(devkit.free_memory_mb(status), 6 * 1024)
 
 
+class TestWorkers(unittest.TestCase):
+
+    RESULT = '{"type":"result","is_error":false,"num_turns":4,"duration_ms":61500,"result":"Done: 17 files.","session_id":"abc-123"}'
+
+    def test_the_result_is_found_after_warning_lines(self):
+        output = 'Ignoring 3 permissions entries\n' + self.RESULT + '\n'
+        self.assertEqual(devkit.parse_worker_output(output)['session_id'], 'abc-123')
+
+    def test_output_without_a_result_is_none(self):
+        self.assertIsNone(devkit.parse_worker_output('boom\n{"type":"system"}\n'))
+        self.assertIsNone(devkit.parse_worker_output(''))
+
+    def test_report_states(self):
+        result = devkit.parse_worker_output(self.RESULT)
+        self.assertEqual(devkit.format_report(None, 'none', None), 'no worker has run in this environment')
+        self.assertIn('still running', devkit.format_report('r1', 'running', None))
+        self.assertIn('ended without a report (exit 1)', devkit.format_report('r1', '1', None))
+        self.assertEqual(
+            devkit.format_report('r1', '0', result), 'Done: 17 files.\n\n[worker r1 finished: 4 turns, 61s]'
+        )
+
+    def test_the_task_text_never_reaches_a_command_line(self):
+        script = devkit.worker_script('/home/dev/app', 'r1', ['--permission-mode', 'auto'])
+        self.assertIn('cat > ~/.devkit-runs/r1/prompt', script)
+        self.assertIn('< ~/.devkit-runs/r1/prompt', script)
+        self.assertIn('setsid nohup', script)
+
+    def test_a_follow_up_resumes_the_previous_session(self):
+        script = devkit.worker_script('/home/dev/app', 'r2', [], resume='abc-123')
+        self.assertIn('--resume abc-123', script)
+
+
 class TestNames(unittest.TestCase):
 
     def test_accepts_branch_like_names(self):

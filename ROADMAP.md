@@ -70,23 +70,27 @@
 - Server memory check before create and start
 - `destroy --all`
 - `stop` and `start` without destroying
+
+### Claude
+- `task` and `report`: a Claude worker inside, detached, final report returned
+- Follow-ups to the same worker session
+- Coordinator skill for a session on the dev machine: create, brief, collect, verify, clean up
+- Same limits for Claude and for people
+- Dedicated PostHog key for environments, with the scopes its tool server asks for
+- Other login-based tool servers left out: MercadoLibre, MercadoPago, Cloudflare
+
+### Opt-in: full login inside an environment
+- `login <name>`: full claude.ai login inside one environment, done once by hand in a browser
+- Remote control for environments that have that login
+- Cross-session messaging between this machine and those environments
+- Progress visible mid-task, not only the final report
+
+### Still open for 0.2
+- Deeper check than "connected": one real call per tool server
+- Project memory mirrored in, transcripts and memory copied back before destroy
 - Memory view, heaviest first
 - Owner recorded per environment: person or Claude session
 - Doctor command: Proxmox access, memory, template, network
-
-### Claude
-- Claude Code plugin with skills: create, list, destroy
-- Skills as thin wrappers over the command-line tool
-- Same limits for Claude and for people
-- `login <name>`: full claude.ai login inside one environment, done once by hand in a browser
-- Remote control and cross-session messaging for environments that have that login
-- Coordinator here, workers inside: tasks handed over SSH, final report returned
-- Workers run detached, so a dropped connection does not kill a task
-- Keyed tool servers kept explicit in the app config
-- Dedicated PostHog key for environments, with the scopes its tool server asks for
-- Other login-based tool servers left out: MercadoLibre, MercadoPago, Cloudflare
-- Deeper check than "connected": one real call per tool server
-- Project memory mirrored in, transcripts and memory copied back before destroy
 
 ### Template
 - `template build` command

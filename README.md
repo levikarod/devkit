@@ -17,6 +17,10 @@ devkit ssh fix-orders               # shell in the project folder
 devkit ssh fix-orders -- make test  # run one command and return
 devkit claude fix-orders            # Claude Code in the project folder
 devkit claude fix-orders -- -p "summarise the last commit"
+devkit task fix-orders "<brief>"    # hand a task to a Claude worker inside; prints its report
+devkit task fix-orders --continue "<follow-up>"   # same worker session
+devkit task fix-orders --detach "<brief>"         # return at once
+devkit report fix-orders --wait     # collect a detached or interrupted worker
 devkit code fix-orders              # open the environment in VS Code over Remote-SSH
 devkit check fix-orders             # compare tool servers here and inside
 devkit stop fix-orders              # free its memory, keep its files
@@ -52,6 +56,14 @@ If a step fails, the half-made environment is removed.
 - Remote control and cross-session messaging do not work inside: both need a full claude.ai login, and environments log in with a long-lived token that can only make model requests.
 - The user inside has `sudo`.
 
+### Workers
+
+- `devkit task` starts a separate Claude session inside the environment and returns its final message.
+- The worker runs detached: if the connection drops it keeps going, and `devkit report <name> --wait` collects it.
+- One worker at a time per environment. `--continue` sends a follow-up to the same session.
+- Workers cannot ask permission questions. They run with `--permission-mode auto`; change it with `[worker] claude_args` in the server config.
+- A Claude session on this machine coordinates workers through the `delegating-to-devkit-workers` skill.
+
 ### Tool servers inside
 
 - Nothing lists plugins or tool servers. Add a plugin on this machine and the next environment has it.
@@ -66,6 +78,7 @@ If a step fails, the half-made environment is removed.
 ```bash
 ln -s ~/devkit/devkit.py ~/.local/bin/devkit
 ln -s ~/devkit/skills/setting-up-devkit ~/.claude/skills/setting-up-devkit
+ln -s ~/devkit/skills/delegating-to-devkit-workers ~/.claude/skills/delegating-to-devkit-workers
 ```
 
 Python 3.11 or newer. No dependencies.
@@ -100,6 +113,9 @@ shared_host = "192.168.1.102"       # usable as {shared_host} in any .devkit.tom
 [claude]
 mirror = true                       # default; false keeps this machine's Claude setup out
 remote_control = false              # default; only useful once an environment has a full claude.ai login
+
+[worker]
+claude_args = ["--permission-mode", "auto"]   # default flags for `devkit task` workers
 
 [network]                           # optional; without it environments use DHCP
 address = "192.168.1.{vmid}/24"     # container 104 gets 192.168.1.104

@@ -27,6 +27,8 @@ NOTE_FILE = 'CLAUDE.local.md'
 CLAUDE_HOME = Path('~/.claude').expanduser()
 MIRRORED = ('plugins', 'skills', 'settings.json', 'CLAUDE.md')
 ACCOUNT_SERVER_PREFIX = 'claude.ai '
+RUNS_DIR = '~/.devkit-runs'
+WORKER_ARGS = ('--permission-mode', 'auto')
 MCP_LINE = re.compile(r'^(?P<name>.+?): .* - (?P<mark>[✔✘!⊘])')
 MCP_STATUS = {'✔': 'connected', '✘': 'failed', '!': 'needs login', '⊘': 'disabled'}
 
@@ -197,6 +199,49 @@ def describe_work(work):
 def free_memory_mb(node_status):
     memory = node_status['memory']
     return (memory['total'] - memory['used']) // 2**20
+
+
+def parse_worker_output(text):
+    for line in reversed(text.splitlines()):
+        line = line.strip()
+        if line.startswith('{'):
+            try:
+                data = json.loads(line)
+            except ValueError:
+                continue
+            if data.get('type') == 'result':
+                return data
+    return None
+
+
+def worker_script(workdir, run_id, claude_args, resume=None):
+    run = f'{RUNS_DIR}/{run_id}'
+    resume_args = f'--resume {shlex.quote(resume)} ' if resume else ''
+    extra = ' '.join(shlex.quote(part) for part in claude_args)
+    inner = (
+        f'[ -f {SECRETS_FILE} ] && . {SECRETS_FILE}; export PATH="$HOME/.local/bin:$PATH"; '
+        f'cd {shlex.quote(workdir)} && '
+        f'claude -p {resume_args}--output-format json {extra} < {run}/prompt > {run}/output 2> {run}/errors; '
+        f'echo $? > {run}/exit'
+    )
+    return (
+        f'set -e; mkdir -p {run}; cat > {run}/prompt; '
+        f'ln -sfn {run_id} {RUNS_DIR}/latest; '
+        f'setsid nohup bash -c {shlex.quote(inner)} > /dev/null 2>&1 < /dev/null & echo started'
+    )
+
+
+def format_report(run_id, state, result):
+    if state == 'none':
+        return 'no worker has run in this environment'
+    if state == 'running':
+        return f'worker {run_id} is still running'
+    if result is None:
+        return f'worker {run_id} ended without a report (exit {state}); see {RUNS_DIR}/{run_id}/errors inside'
+    seconds = (result.get('duration_ms') or 0) // 1000
+    status = 'failed' if result.get('is_error') else 'finished'
+    footer = f"[worker {run_id} {status}: {result.get('num_turns', '?')} turns, {seconds}s]"
+    return f"{(result.get('result') or '').strip()}\n\n{footer}"
 
 
 def public_keys(text):
@@ -585,6 +630,54 @@ git log --oneline -1
         print(f'  VS Code  Remote-SSH: Connect to Host… → {self.user}@{address}')
         print(f'  or run   code --folder-uri {uri}')
 
+    def _worker_state(self, remote):
+        script = (
+            f'cd {RUNS_DIR} 2>/dev/null || {{ echo none; exit 0; }}; '
+            '[ -e latest ] || { echo none; exit 0; }; '
+            'id=$(readlink latest); echo "$id"; '
+            '[ -f latest/exit ] && { cat latest/exit; cat latest/output; } || echo running'
+        )
+        lines = remote.run(script).splitlines()
+        if not lines or lines[0] == 'none':
+            return None, 'none', None
+        run_id, state = lines[0], lines[1] if len(lines) > 1 else 'running'
+        result = parse_worker_output('\n'.join(lines[2:])) if state != 'running' else None
+        return run_id, state, result
+
+    def task(self, name, prompt, resume=False, detach=False):
+        container = self.proxmox.find(validate_name(name))
+        if container['status'] != 'running':
+            raise DevkitError(f"'{name}' is stopped; start it first")
+        remote = self.remote(container['vmid'])
+        run_id, state, result = self._worker_state(remote)
+        if state == 'running':
+            raise DevkitError(f"worker {run_id} is still running in '{name}'; wait for it with: devkit report {name} --wait")
+        session = None
+        if resume:
+            session = (result or {}).get('session_id')
+            if not session:
+                raise DevkitError(f"'{name}' has no finished worker to continue")
+        new_id = time.strftime('%Y%m%d-%H%M%S')
+        args = self.server.get('worker', {}).get('claude_args', list(WORKER_ARGS))
+        remote.run(worker_script(self.workdir, new_id, args, resume=session), stdin=prompt)
+        if detach:
+            print(f"worker {new_id} started in '{name}'; collect it with: devkit report {name} --wait")
+            return 0
+        return self.report(name, wait=True)
+
+    def report(self, name, wait=False):
+        container = self.proxmox.find(validate_name(name))
+        remote = self.remote(container['vmid'])
+        run_id, state, result = self._worker_state(remote)
+        while wait and state == 'running':
+            time.sleep(3)
+            try:
+                run_id, state, result = self._worker_state(remote)
+            except DevkitError:
+                continue
+        print(format_report(run_id, state, result))
+        return 0 if state not in ('running',) and result and not result.get('is_error') else (2 if state == 'running' else 1 if state != 'none' else 0)
+
     def _mirror_claude(self, remote):
         items = [item for item in MIRRORED if (CLAUDE_HOME / item).exists()]
         if items:
@@ -717,9 +810,11 @@ git log --oneline -1
         if container['status'] != 'running':
             return None
         remote = self.remote(container['vmid'])
-        result = subprocess.run(
-            remote.command(f'cd {shlex.quote(self.workdir)} && {WORK_PROBE}'), capture_output=True, text=True,
-        )
+        probe = f'cd {shlex.quote(self.workdir)} && (git fetch -q origin 2>/dev/null || true) && {WORK_PROBE}'
+        with Agent(self.github_key) as env:
+            result = subprocess.run(
+                remote.command(probe, forward=True), capture_output=True, text=True, env=env,
+            )
         return parse_work(result.stdout) if result.returncode == 0 else None
 
     def _may_destroy(self, name, container, force):
@@ -829,6 +924,14 @@ def build_parser():
     claude = commands.add_parser('claude', help='open Claude Code inside an environment')
     claude.add_argument('name')
     claude.add_argument('claude_arguments', nargs=argparse.REMAINDER)
+    task = commands.add_parser('task', help='hand a task to a Claude worker inside and print its report')
+    task.add_argument('name')
+    task.add_argument('prompt', help="the task; '-' reads it from standard input")
+    task.add_argument('--continue', dest='resume', action='store_true', help="continue the last worker's session")
+    task.add_argument('--detach', action='store_true', help='return at once; collect with report')
+    report = commands.add_parser('report', help="print the last worker's report")
+    report.add_argument('name')
+    report.add_argument('--wait', action='store_true', help='block until the worker finishes')
     code = commands.add_parser('code', help='open an environment in VS Code over Remote-SSH')
     code.add_argument('name')
     destroy = commands.add_parser('destroy', help='destroy an environment')
@@ -861,6 +964,13 @@ def main(argv=None):
             return devkit.ssh(arguments.name, strip_separator(arguments.remote_command))
         elif arguments.command == 'claude':
             return devkit.claude(arguments.name, strip_separator(arguments.claude_arguments))
+        elif arguments.command == 'task':
+            prompt = sys.stdin.read() if arguments.prompt == '-' else arguments.prompt
+            if not prompt.strip():
+                raise DevkitError('the task is empty')
+            return devkit.task(arguments.name, prompt, resume=arguments.resume, detach=arguments.detach)
+        elif arguments.command == 'report':
+            return devkit.report(arguments.name, wait=arguments.wait)
         elif arguments.command == 'code':
             devkit.code(arguments.name)
         elif arguments.command == 'destroy':
