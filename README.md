@@ -17,6 +17,7 @@ devkit ssh fix-orders               # shell in the project folder
 devkit ssh fix-orders -- make test  # run one command and return
 devkit claude fix-orders            # Claude Code in the project folder
 devkit claude fix-orders -- -p "summarise the last commit"
+devkit code fix-orders              # open the environment in VS Code over Remote-SSH
 devkit check fix-orders             # compare tool servers here and inside
 devkit destroy fix-orders           # asks first; -y skips the question
 ```
@@ -81,6 +82,7 @@ max_environments = 3
 user = "dev"
 key = "~/.ssh/devkit_ed25519"       # reaches environments
 github_key = "~/.ssh/id_ed25519"    # lent to environments through agent forwarding
+authorize = "~/.ssh/authorized_keys" # optional: these public keys may log into environments
 
 [secrets]
 file = "~/droppo-v2/.env"           # where secret values are looked up

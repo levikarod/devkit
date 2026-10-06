@@ -168,6 +168,19 @@ def compare_tool_servers(here, inside):
     return len(working_here), missing, extra
 
 
+def public_keys(text):
+    keys = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line and not line.startswith('#') and line not in keys:
+            keys.append(line)
+    return keys
+
+
+def editor_uri(user, address, workdir):
+    return f'vscode-remote://ssh-remote+{user}@{address}{workdir}'
+
+
 def encode_description(branch):
     return f'devkit branch={branch}'
 
@@ -413,6 +426,7 @@ class Devkit:
             self._checkout(remote, branch)
             step('pushing settings')
             self._push_settings(remote)
+            self._authorize_keys(remote)
             if self.server.get('claude', {}).get('mirror', True):
                 step('mirroring the Claude setup')
                 self._mirror_claude(remote)
@@ -494,6 +508,44 @@ git log --oneline -1
         note = self.project.get('note')
         if note:
             remote.run(f'cat > {shlex.quote(self.workdir + "/" + NOTE_FILE)}', stdin=note.strip() + '\n')
+
+    def _authorize_keys(self, remote):
+        source = self.server['ssh'].get('authorize')
+        if not source or not Path(source).expanduser().is_file():
+            return 0
+        keys = public_keys(Path(source).expanduser().read_text())
+        script = (
+            'import os, sys\n'
+            'path = os.path.expanduser("~/.ssh/authorized_keys")\n'
+            'have = open(path).read().splitlines() if os.path.exists(path) else []\n'
+            'new = [key for key in sys.stdin.read().splitlines() if key and key not in have]\n'
+            'open(path, "a").write("".join(key + "\\n" for key in new))\n'
+            'os.chmod(path, 0o600)\n'
+        )
+        remote.run(f'python3 -c {shlex.quote(script)}', stdin='\n'.join(keys) + '\n')
+        return len(keys)
+
+    def code(self, name):
+        container = self.proxmox.find(validate_name(name))
+        remote = self.remote(container['vmid'])
+        address = remote.target.split('@')[1]
+        count = self._authorize_keys(remote)
+        if not count:
+            raise DevkitError(
+                "no keys to authorize: set [ssh] authorize in the server config to the file "
+                "listing the public keys of the machine your editor runs on"
+            )
+        uri = editor_uri(self.user, address, self.workdir)
+        if os.environ.get('VSCODE_IPC_HOOK_CLI') and subprocess.run(
+            ['code', '--folder-uri', uri], capture_output=True,
+        ).returncode == 0:
+            print(f'opening {name} in VS Code')
+            return
+        print(f'{name} accepts the {count} key(s) from {self.server["ssh"]["authorize"]}')
+        print(f'  host     {self.user}@{address}')
+        print(f'  folder   {self.workdir}')
+        print(f'  VS Code  Remote-SSH: Connect to Host… → {self.user}@{address}')
+        print(f'  or run   code --folder-uri {uri}')
 
     def _mirror_claude(self, remote):
         items = [item for item in MIRRORED if (CLAUDE_HOME / item).exists()]
@@ -658,6 +710,8 @@ def build_parser():
     claude = commands.add_parser('claude', help='open Claude Code inside an environment')
     claude.add_argument('name')
     claude.add_argument('claude_arguments', nargs=argparse.REMAINDER)
+    code = commands.add_parser('code', help='open an environment in VS Code over Remote-SSH')
+    code.add_argument('name')
     destroy = commands.add_parser('destroy', help='destroy an environment')
     destroy.add_argument('name')
     destroy.add_argument('-y', '--yes', action='store_true', help='skip the confirmation prompt')
@@ -682,6 +736,8 @@ def main(argv=None):
             return devkit.ssh(arguments.name, strip_separator(arguments.remote_command))
         elif arguments.command == 'claude':
             return devkit.claude(arguments.name, strip_separator(arguments.claude_arguments))
+        elif arguments.command == 'code':
+            devkit.code(arguments.name)
         elif arguments.command == 'destroy':
             devkit.destroy(arguments.name, arguments.yes)
     except DevkitError as error:

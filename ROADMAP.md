@@ -57,6 +57,12 @@
 - Root for the inside user, for one-off fixes
 - Project tool servers pre-approved inside
 
+## Version 0.1.2: see the work
+
+- `code <name>`: environment opened in VS Code over Remote-SSH
+- Editor's public keys authorized in every environment at create
+- Keys taken from the dev machine's own authorized list, nothing new to manage
+
 ## Version 0.2: comfortable
 
 ### Safety

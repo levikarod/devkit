@@ -204,6 +204,19 @@ mysql-mcp-server: bash scripts/mcp_mysql.sh - ✔ Connected
         self.assertEqual((total, missing), (0, []))
 
 
+class TestEditorAccess(unittest.TestCase):
+
+    def test_public_keys_skip_comments_blanks_and_repeats(self):
+        text = '# laptop\nssh-ed25519 AAA me\n\nssh-ed25519 AAA me\nssh-rsa BBB other\n'
+        self.assertEqual(devkit.public_keys(text), ['ssh-ed25519 AAA me', 'ssh-rsa BBB other'])
+
+    def test_editor_uri_points_at_the_project_folder(self):
+        self.assertEqual(
+            devkit.editor_uri('dev', '192.168.1.104', '/home/dev/app'),
+            'vscode-remote://ssh-remote+dev@192.168.1.104/home/dev/app',
+        )
+
+
 class TestNames(unittest.TestCase):
 
     def test_accepts_branch_like_names(self):
