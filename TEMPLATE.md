@@ -1,6 +1,6 @@
 # Building the template by hand
 
-Proxmox node `dev`, pool `devkit`. Current template: container 107.
+Proxmox node `dev`, pool `devkit`. Current template: container 105.
 
 ## As the API token
 - Create an unprivileged Debian 12 container in the pool: 4 cores, 3072 MB, 20 GB on `local-lvm`, `features=nesting=1`, DHCP, the devkit SSH public key
@@ -24,6 +24,7 @@ Proxmox node `dev`, pool `devkit`. Current template: container 107.
 - Optional warm-up as `dev`: run `claude mcp list` once in the project folder so tool server packages are cached, then delete `~/.claude.json`
 - As `dev`: clone or `git init` the app repo at the path named by `workdir` in the app's `.devkit.toml`
 - Load the app's Docker images (`docker save ... | ssh ... docker load`)
+- Tag the app image once per compose service that builds from it (`docker tag <project>-<first> <project>-<service>`), so any of them starts with `--no-build`
 
 ## Identity wipe, last step before freezing
 - Install a one-shot unit that runs `ssh-keygen -A` before `ssh.service` when host keys are missing

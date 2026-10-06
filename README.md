@@ -21,6 +21,8 @@ devkit task fix-orders "<brief>"    # hand a task to a Claude worker inside; pri
 devkit task fix-orders --continue "<follow-up>"   # same worker session
 devkit task fix-orders --detach "<brief>"         # return at once
 devkit report fix-orders --wait     # collect a detached or interrupted worker
+devkit report fix-orders --json     # state and report for scripts: none, running, finished, failed, timeout, stopped
+devkit ship fix-orders -m "fix: ..." # commit everything inside and push its branch
 devkit code fix-orders              # open the environment in VS Code over Remote-SSH
 devkit check fix-orders             # compare tool servers here and inside
 devkit stop fix-orders              # free its memory, keep its files
@@ -60,7 +62,8 @@ If a step fails, the half-made environment is removed.
 
 - `devkit task` starts a separate Claude session inside the environment and returns its final message.
 - The worker runs detached: if the connection drops it keeps going, and `devkit report <name> --wait` collects it.
-- One worker at a time per environment. `--continue` sends a follow-up to the same session.
+- One worker at a time per environment. `--continue` sends a follow-up to the same session, also after `stop` and `start`.
+- A worker is stopped after one hour; change it with `[worker] timeout_seconds` in the server config.
 - Workers cannot ask permission questions. They run with `--permission-mode auto`; change it with `[worker] claude_args` in the server config.
 - A Claude session on this machine coordinates workers through the `delegating-to-devkit-workers` skill.
 
@@ -93,7 +96,7 @@ pool = "devkit"
 template = 107
 
 [limits]
-max_environments = 3
+max_environments = 3                # running ones; stopped environments do not count
 min_free_memory_mb = 2048           # optional: create and start refuse below this
 
 [ssh]
@@ -116,6 +119,7 @@ remote_control = false              # default; only useful once an environment h
 
 [worker]
 claude_args = ["--permission-mode", "auto"]   # default flags for `devkit task` workers
+timeout_seconds = 3600                         # a worker is stopped after this long
 
 [network]                           # optional; without it environments use DHCP
 address = "192.168.1.{vmid}/24"     # container 104 gets 192.168.1.104

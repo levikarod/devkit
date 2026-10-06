@@ -308,3 +308,71 @@ class TestAge(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestRunningLimit(unittest.TestCase):
+
+    ENVIRONMENTS = [
+        {'name': 'env-a', 'status': 'running'},
+        {'name': 'env-b', 'status': 'stopped'},
+        {'name': 'env-c', 'status': 'running'},
+    ]
+
+    def test_stopped_environments_do_not_count(self):
+        self.assertEqual(devkit.running_names(self.ENVIRONMENTS), ['a', 'c'])
+
+    def test_the_limit_is_reached_by_running_ones_only(self):
+        self.assertIsNone(devkit.limit_reached(self.ENVIRONMENTS, 3))
+        self.assertEqual(devkit.limit_reached(self.ENVIRONMENTS, 2), ['a', 'c'])
+
+
+class TestWorkerTimeLimit(unittest.TestCase):
+
+    def test_the_worker_is_bounded_when_a_limit_is_set(self):
+        script = devkit.worker_script('/home/dev/app', '20260101-000000', ['--permission-mode', 'auto'], timeout=3600)
+        self.assertIn('timeout 3600 claude -p', script)
+
+    def test_no_limit_leaves_the_worker_unbounded(self):
+        script = devkit.worker_script('/home/dev/app', '20260101-000000', [])
+        self.assertNotIn('timeout', script)
+
+    def test_a_worker_stopped_at_the_limit_says_so(self):
+        self.assertIn('time limit', devkit.format_report('r1', '124', None))
+
+
+class TestReportData(unittest.TestCase):
+
+    RESULT = {'type': 'result', 'result': ' done \n', 'is_error': False,
+              'session_id': 'abc', 'num_turns': 4, 'duration_ms': 9500}
+
+    def test_states(self):
+        self.assertEqual(devkit.report_data(None, 'none', None)['state'], 'none')
+        self.assertEqual(devkit.report_data('r1', 'running', None)['state'], 'running')
+        self.assertEqual(devkit.report_data('r1', '0', self.RESULT)['state'], 'finished')
+        self.assertEqual(devkit.report_data('r1', '1', dict(self.RESULT, is_error=True))['state'], 'failed')
+        self.assertEqual(devkit.report_data('r1', '1', None)['state'], 'failed')
+        self.assertEqual(devkit.report_data('r1', '124', None)['state'], 'timeout')
+
+    def test_a_finished_worker_carries_its_report_and_session(self):
+        data = devkit.report_data('r1', '0', self.RESULT)
+        self.assertEqual(data['report'], 'done')
+        self.assertEqual(data['session_id'], 'abc')
+        self.assertEqual(data['run_id'], 'r1')
+        self.assertEqual(data['seconds'], 9)
+
+
+class TestShip(unittest.TestCase):
+
+    def test_the_message_and_identity_are_shell_quoted(self):
+        script = devkit.ship_script('/home/dev/app', "fix: it's done", 'Ana Li', 'ana@example.com')
+        self.assertIn("""'fix: it'"'"'s done'""", script)
+        self.assertIn("user.name='Ana Li'", script)
+        self.assertIn('user.email=ana@example.com', script)
+
+    def test_a_clean_checkout_ships_nothing(self):
+        script = devkit.ship_script('/home/dev/app', 'm', 'n', 'e@x')
+        self.assertIn('nothing to ship', script)
+
+    def test_the_current_branch_is_pushed(self):
+        script = devkit.ship_script('/home/dev/app', 'm', 'n', 'e@x')
+        self.assertIn('-u origin HEAD', script)

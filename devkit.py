@@ -29,6 +29,8 @@ MIRRORED = ('plugins', 'skills', 'settings.json', 'CLAUDE.md')
 ACCOUNT_SERVER_PREFIX = 'claude.ai '
 RUNS_DIR = '~/.devkit-runs'
 WORKER_ARGS = ('--permission-mode', 'auto')
+WORKER_TIMEOUT = 3600
+TIMEOUT_EXIT = '124'
 MCP_LINE = re.compile(r'^(?P<name>.+?): .* - (?P<mark>[✔✘!⊘])')
 MCP_STATUS = {'✔': 'connected', '✘': 'failed', '!': 'needs login', '⊘': 'disabled'}
 
@@ -214,14 +216,15 @@ def parse_worker_output(text):
     return None
 
 
-def worker_script(workdir, run_id, claude_args, resume=None):
+def worker_script(workdir, run_id, claude_args, resume=None, timeout=None):
     run = f'{RUNS_DIR}/{run_id}'
     resume_args = f'--resume {shlex.quote(resume)} ' if resume else ''
     extra = ' '.join(shlex.quote(part) for part in claude_args)
+    bound = f'timeout {int(timeout)} ' if timeout else ''
     inner = (
         f'[ -f {SECRETS_FILE} ] && . {SECRETS_FILE}; export PATH="$HOME/.local/bin:$PATH"; '
         f'cd {shlex.quote(workdir)} && '
-        f'claude -p {resume_args}--output-format json {extra} < {run}/prompt > {run}/output 2> {run}/errors; '
+        f'{bound}claude -p {resume_args}--output-format json {extra} < {run}/prompt > {run}/output 2> {run}/errors; '
         f'echo $? > {run}/exit'
     )
     return (
@@ -236,12 +239,55 @@ def format_report(run_id, state, result):
         return 'no worker has run in this environment'
     if state == 'running':
         return f'worker {run_id} is still running'
+    if state == TIMEOUT_EXIT and result is None:
+        return f'worker {run_id} was stopped at the time limit; see {RUNS_DIR}/{run_id}/errors inside'
     if result is None:
         return f'worker {run_id} ended without a report (exit {state}); see {RUNS_DIR}/{run_id}/errors inside'
     seconds = (result.get('duration_ms') or 0) // 1000
     status = 'failed' if result.get('is_error') else 'finished'
     footer = f"[worker {run_id} {status}: {result.get('num_turns', '?')} turns, {seconds}s]"
     return f"{(result.get('result') or '').strip()}\n\n{footer}"
+
+
+def report_data(run_id, state, result):
+    if state in ('none', 'running'):
+        return {'run_id': run_id, 'state': state}
+    if state == TIMEOUT_EXIT and result is None:
+        return {'run_id': run_id, 'state': 'timeout'}
+    if result is None or result.get('is_error'):
+        outcome = 'failed'
+    else:
+        outcome = 'finished'
+    result = result or {}
+    return {
+        'run_id': run_id,
+        'state': outcome,
+        'exit': state,
+        'report': (result.get('result') or '').strip(),
+        'session_id': result.get('session_id'),
+        'turns': result.get('num_turns'),
+        'seconds': (result.get('duration_ms') or 0) // 1000,
+    }
+
+
+def running_names(environments):
+    return [c['name'][len(ENV_PREFIX):] for c in environments if c['status'] == 'running']
+
+
+def limit_reached(environments, limit):
+    names = running_names(environments)
+    return names if len(names) >= limit else None
+
+
+def ship_script(workdir, message, author_name, author_email):
+    identity = f'-c user.name={shlex.quote(author_name)} -c user.email={shlex.quote(author_email)}'
+    return (
+        f'set -e; cd {shlex.quote(workdir)}; git add -A; '
+        'if git diff --cached --quiet; then echo "nothing to ship"; exit 0; fi; '
+        f'git {identity} commit -q -m {shlex.quote(message)}; '
+        'git push -q -u origin HEAD; '
+        'echo "shipped $(git rev-parse --short HEAD) to $(git rev-parse --abbrev-ref HEAD)"'
+    )
 
 
 def public_keys(text):
@@ -480,10 +526,7 @@ class Devkit:
         existing = self.proxmox.environments()
         if any(c['name'] == ENV_PREFIX + name for c in existing):
             raise DevkitError(f"environment '{name}' already exists")
-        limit = self.server['limits']['max_environments']
-        if len(existing) >= limit:
-            names = ', '.join(c['name'][len(ENV_PREFIX):] for c in existing)
-            raise DevkitError(f'limit of {limit} environments reached ({names}); destroy one first')
+        self._require_room(existing)
         self._require_memory()
         vmid = self.proxmox.next_id()
         started = time.time()
@@ -658,15 +701,20 @@ git log --oneline -1
             if not session:
                 raise DevkitError(f"'{name}' has no finished worker to continue")
         new_id = time.strftime('%Y%m%d-%H%M%S')
-        args = self.server.get('worker', {}).get('claude_args', list(WORKER_ARGS))
-        remote.run(worker_script(self.workdir, new_id, args, resume=session), stdin=prompt)
+        worker = self.server.get('worker', {})
+        args = worker.get('claude_args', list(WORKER_ARGS))
+        timeout = worker.get('timeout_seconds', WORKER_TIMEOUT)
+        remote.run(worker_script(self.workdir, new_id, args, resume=session, timeout=timeout), stdin=prompt)
         if detach:
             print(f"worker {new_id} started in '{name}'; collect it with: devkit report {name} --wait")
             return 0
         return self.report(name, wait=True)
 
-    def report(self, name, wait=False):
+    def report(self, name, wait=False, as_json=False):
         container = self.proxmox.find(validate_name(name))
+        if as_json and container['status'] != 'running':
+            print(json.dumps({'run_id': None, 'state': 'stopped'}))
+            return 0
         remote = self.remote(container['vmid'])
         run_id, state, result = self._worker_state(remote)
         while wait and state == 'running':
@@ -675,8 +723,27 @@ git log --oneline -1
                 run_id, state, result = self._worker_state(remote)
             except DevkitError:
                 continue
+        if as_json:
+            print(json.dumps(report_data(run_id, state, result)))
+            return 0
         print(format_report(run_id, state, result))
         return 0 if state not in ('running',) and result and not result.get('is_error') else (2 if state == 'running' else 1 if state != 'none' else 0)
+
+    def ship(self, name, message):
+        container = self.proxmox.find(validate_name(name))
+        if container['status'] != 'running':
+            raise DevkitError(f"'{name}' is stopped; start it first")
+        author = [
+            subprocess.run(['git', 'config', key], cwd=self.project_root, capture_output=True, text=True).stdout.strip()
+            for key in ('user.name', 'user.email')
+        ]
+        if not all(author):
+            raise DevkitError('git user.name and user.email are not set on this machine')
+        remote = self.remote(container['vmid'])
+        with Agent(self.github_key) as env:
+            return subprocess.run(
+                remote.command(ship_script(self.workdir, message, *author), forward=True), env=env,
+            ).returncode
 
     def _mirror_claude(self, remote):
         items = [item for item in MIRRORED if (CLAUDE_HOME / item).exists()]
@@ -767,7 +834,8 @@ git log --oneline -1
         widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
         for row in rows:
             print('  '.join(cell.ljust(width) for cell, width in zip(row, widths)).rstrip())
-        print(f"\n{len(environments)} of {self.server['limits']['max_environments']} environments")
+        print(f"\n{len(running_names(environments))} of {self.server['limits']['max_environments']} "
+              f"running, {len(environments)} in total")
 
     def ssh(self, name, command):
         container = self.proxmox.find(validate_name(name))
@@ -794,6 +862,14 @@ git log --oneline -1
             return subprocess.run(
                 remote.command(script, forward=True, tty=sys.stdin.isatty()), env=env,
             ).returncode
+
+    def _require_room(self, environments):
+        limit = self.server['limits']['max_environments']
+        names = limit_reached(environments, limit)
+        if names:
+            raise DevkitError(
+                f"limit of {limit} running environments reached ({', '.join(names)}); stop or destroy one first"
+            )
 
     def _require_memory(self):
         needed = self.server['limits'].get('min_free_memory_mb')
@@ -880,6 +956,7 @@ git log --oneline -1
         if container['status'] == 'running':
             print(f"'{name}' is already running")
             return
+        self._require_room(self.proxmox.environments())
         self._require_memory()
         self.proxmox.start(container['vmid'])
         remote = self.remote(container['vmid'])
@@ -932,6 +1009,10 @@ def build_parser():
     report = commands.add_parser('report', help="print the last worker's report")
     report.add_argument('name')
     report.add_argument('--wait', action='store_true', help='block until the worker finishes')
+    report.add_argument('--json', dest='as_json', action='store_true', help='machine-readable state and report')
+    ship = commands.add_parser('ship', help='commit everything inside an environment and push its branch')
+    ship.add_argument('name')
+    ship.add_argument('-m', '--message', required=True)
     code = commands.add_parser('code', help='open an environment in VS Code over Remote-SSH')
     code.add_argument('name')
     destroy = commands.add_parser('destroy', help='destroy an environment')
@@ -970,7 +1051,9 @@ def main(argv=None):
                 raise DevkitError('the task is empty')
             return devkit.task(arguments.name, prompt, resume=arguments.resume, detach=arguments.detach)
         elif arguments.command == 'report':
-            return devkit.report(arguments.name, wait=arguments.wait)
+            return devkit.report(arguments.name, wait=arguments.wait, as_json=arguments.as_json)
+        elif arguments.command == 'ship':
+            return devkit.ship(arguments.name, arguments.message)
         elif arguments.command == 'code':
             devkit.code(arguments.name)
         elif arguments.command == 'destroy':
