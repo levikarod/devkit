@@ -114,6 +114,8 @@
 ## Later
 
 ### Lifecycle
+- `prune`: destroy every environment whose branch is merged or deleted and holds no leftover work
+- `prune` run by a schedule, so cleanup does not depend on the session that created the environment
 - Auto-drop when the branch is merged or deleted
 - Idle timeout that stops unused environments
 - Orphan cleanup
