@@ -105,6 +105,8 @@ user = "dev"
 key = "~/.ssh/devkit_ed25519"       # reaches environments
 github_key = "~/.ssh/id_ed25519"    # lent to environments through agent forwarding
 authorize = "~/.ssh/authorized_keys" # optional: these public keys may log into environments
+host_key = "~/.config/devkit/host_ed25519"  # optional: one SSH identity for every environment, so a reused
+                                    # address never trips "host identification has changed"; made if missing
 
 [secrets]
 file = "~/droppo-v2/.env"           # where secret values are looked up

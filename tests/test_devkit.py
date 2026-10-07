@@ -386,3 +386,17 @@ class TestListData(unittest.TestCase):
             devkit.environment_summary(container, 'fix/glitchtip-10071'),
             {'name': 'gt-10071', 'branch': 'fix/glitchtip-10071', 'state': 'stopped'},
         )
+
+
+class TestSharedHostKey(unittest.TestCase):
+
+    def test_the_key_arrives_on_standard_input_never_in_the_script(self):
+        script = devkit.host_key_script()
+        self.assertIn('cat >', script)
+        self.assertNotIn('PRIVATE KEY', script)
+
+    def test_only_the_shared_key_is_offered_afterwards(self):
+        script = devkit.host_key_script()
+        self.assertIn('HostKey /etc/ssh/ssh_host_ed25519_key', script)
+        self.assertIn('sshd_config.d', script)
+        self.assertIn('restart ssh', script)

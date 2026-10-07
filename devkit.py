@@ -294,6 +294,19 @@ def ship_script(workdir, message, author_name, author_email):
     )
 
 
+HOST_KEY_PATH = '/etc/ssh/ssh_host_ed25519_key'
+
+
+def host_key_script():
+    return (
+        'set -e; umask 077; staged=$(mktemp); cat > "$staged"; '
+        f'sudo install -m 600 -o root -g root "$staged" {HOST_KEY_PATH}; rm -f "$staged"; '
+        f"sudo sh -c 'ssh-keygen -y -f {HOST_KEY_PATH} > {HOST_KEY_PATH}.pub; "
+        f'echo "HostKey {HOST_KEY_PATH}" > /etc/ssh/sshd_config.d/devkit-hostkey.conf; '
+        "systemctl restart ssh'"
+    )
+
+
 def public_keys(text):
     keys = []
     for line in text.splitlines():
@@ -557,6 +570,7 @@ class Devkit:
             step('pushing settings')
             self._push_settings(remote)
             self._authorize_keys(remote)
+            self._share_host_key(remote)
             if self.server.get('claude', {}).get('mirror', True):
                 step('mirroring the Claude setup')
                 self._mirror_claude(remote)
@@ -639,6 +653,18 @@ git log --oneline -1
         if note:
             remote.run(f'cat > {shlex.quote(self.workdir + "/" + NOTE_FILE)}', stdin=note.strip() + '\n')
 
+    def _share_host_key(self, remote):
+        configured = self.server['ssh'].get('host_key')
+        if not configured:
+            return False
+        path = Path(configured).expanduser()
+        if not path.is_file():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-C', 'devkit-environments',
+                            '-f', str(path)], check=True)
+        remote.run(host_key_script(), stdin=path.read_text())
+        return True
+
     def _authorize_keys(self, remote):
         source = self.server['ssh'].get('authorize')
         if not source or not Path(source).expanduser().is_file():
@@ -660,6 +686,7 @@ git log --oneline -1
         remote = self.remote(container['vmid'])
         address = remote.target.split('@')[1]
         count = self._authorize_keys(remote)
+        self._share_host_key(remote)
         if not count:
             raise DevkitError(
                 "no keys to authorize: set [ssh] authorize in the server config to the file "
