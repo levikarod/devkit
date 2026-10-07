@@ -1,6 +1,6 @@
 ---
 name: setting-up-devkit
-description: Use when a repository needs a .devkit.toml, when adding a project to devkit, when `devkit` reports "no .devkit.toml found", when a devkit environment starts with wrong settings, leaked tokens or a missing tool server, or when asked which settings, secrets or MCP servers a disposable environment should receive.
+description: Use when asked to set up devkit for a repository or folder ("set up devkit for ~/some-repo"), when a repository needs a .devkit.toml, when adding a project to devkit, when `devkit` reports "no .devkit.toml found", when a devkit environment starts with wrong settings, leaked tokens or a missing tool server, or when asked which settings, secrets or MCP servers a disposable environment should receive.
 ---
 
 # Setting up devkit for a repository
@@ -10,6 +10,20 @@ description: Use when a repository needs a .devkit.toml, when adding a project t
 devkit creates disposable environments: a Proxmox container cloned from a template, with Docker and Claude Code inside. The tool holds nothing about any project. Everything project-specific lives in one file, `.devkit.toml`, at the root of the app repo. This skill writes and checks that file.
 
 **Core principle:** an environment gets only what its work needs. Every setting, secret and tool server it receives is named in `.devkit.toml`; nothing else leaves the dev machine.
+
+## The whole setup, start to finish
+
+The repository is the argument: the path the user names, or the current folder. Work in that folder for every step; pass `-C <repo>` to devkit when it is not the current one.
+
+1. **Write `<repo>/.devkit.toml`** as the sections below describe. Ask the user only the decisions that are theirs.
+2. **Stop once and ask the user to type one line**, exactly: `! devkit -C <repo> setup`
+   - Typed with `!` it runs as the user. It installs whatever the machine is missing and adds the permission rules to that project. A Claude session cannot do this step: adding its own permissions is refused, and so is every devkit command until they exist.
+   - Read its output. Any `NEEDS YOU` line is the user's to resolve; say what it means and wait.
+3. **Offer a project template** when the project builds Docker images or installs dependencies: add `[template] prepare` to the file (see below) and run `devkit -C <repo> template build`. If the command is refused, ask the user to type it with `!`. It takes a few minutes and makes every later `create` fast. Skip it for a project that needs nothing prepared.
+4. **Verify** with a probe environment, as the Verify section describes, and destroy the probe.
+5. **Report**: what the environment will receive, what is switched off, what is still live, and that `.devkit.toml` and `.claude/settings.json` are ready to review and commit.
+
+Do not run `devkit setup` yourself, and do not edit `.claude/settings.json` to add the rules. If a devkit command is refused, the user has not run step 2 yet.
 
 ## Where configuration lives
 
@@ -112,6 +126,26 @@ Do not decide these silently. List them, say what each allows, and ask:
 
 Record the outcome under "Still live" in the note.
 
+### Template preparation
+
+`[template] prepare` is a list of shell commands that `devkit template build` runs once, in the project folder, as the environment's user. Whatever they leave on disk is in every environment from then on.
+
+```toml
+[template]
+prepare = [
+    "docker compose build -q app",
+    "for s in worker scheduler; do docker tag myproject-app myproject-$s; done",
+    "docker compose pull -q redis",
+]
+```
+
+- **Put the slow, repeatable things here:** building the app's image, pulling the images of services environments run themselves, installing dependencies into a cache.
+- **Build each image once.** When several compose services build from the same Dockerfile, build one and tag it for the others; compose names images `<folder>-<service>`.
+- **Only the services environments start.** Not the shared databases, not their migration jobs.
+- **No secrets are available.** The settings file exists during preparation but every value is blank, and it is removed before the template is frozen. A command that needs a real credential cannot go here.
+- **Leave it out** when nothing needs preparing: `create` then starts from the base and clones the repo.
+- `name` at the top of the file names the project's template; it defaults to the folder name. `[environment] memory_mb` and `cores` override the server's size for this project.
+
 ### The note
 
 State, for the session inside: which services are shared and where, the smallest set of containers that runs the tests (confirm it by running them, see Verify), what is switched off, what is still live, and the list that must never start.
@@ -134,14 +168,10 @@ Only services that accept a key in a request header fit. Browser-login-only serv
 - Use a key made for environments, separate from any automation key, with the narrowest scopes that work. PostHog's server rejects keys lacking `user:read`.
 - List only what work inside an environment needs.
 
-## Permissions
-
-Writing `.devkit.toml` does not let Claude sessions run devkit in this project. That takes allow rules in the project's `.claude/settings.json`, and a Claude session may not add them itself. When the file is done, tell the user to run `devkit setup` from the project folder, then review and commit the settings change.
-
 ## Verify
 
 ```bash
-devkit create probe <base_branch>
+devkit create probe <base_branch> --no-check
 devkit ssh probe -- bash -c 'for k in <dropped keys>; do echo "$k $(grep -c "^$k=" .env)"; done; grep -E "^(<forced keys>)=" .env; cat CLAUDE.local.md | head -5'
 devkit claude probe -- mcp list
 devkit destroy probe -y
@@ -153,11 +183,11 @@ Every dropped key must count 0, the create output must show no `warning:` line, 
 
 - No containers are started at create. The compose file is used unchanged, with `--no-deps`.
 - Only branches pushed to the remote reach an environment; a new branch is cut from `base_branch`.
-- The template must already contain the repo at `workdir` and the app's Docker images. Building one is in `~/devkit/TEMPLATE.md` and needs root on the server once.
+- `create` starts from the project's template when `devkit template build` has made one, and from the base otherwise, cloning the repo. `~/devkit/TEMPLATE.md` explains both.
 - The cap on environments is in the server config. `devkit list` shows usage.
 - Each environment is its own machine, so fixed container names and published ports in the compose file do not collide.
 - Shared services must be published on the dev machine's network address, not only on its internal Docker network.
-- `destroy` does not check for unpushed work.
+- `destroy` refuses when uncommitted or unpushed work is inside; `--force` overrides.
 
 ## Common mistakes
 

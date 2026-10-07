@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import contextlib
 import fcntl
 import json
 import os
@@ -31,6 +32,22 @@ RUNS_DIR = '~/.devkit-runs'
 WORKER_ARGS = ('--permission-mode', 'auto')
 WORKER_TIMEOUT = 3600
 TIMEOUT_EXIT = '124'
+BASE_TEMPLATE = 'devkit-base'
+PROJECT_TEMPLATE_PREFIX = 'devkit-tpl-'
+BUILD_PREFIX = 'devkit-build-'
+ROOT_STEP_TIMEOUT = 1800
+TEMPLATE_DEFAULTS = {
+    'os_template': 'local:vztmpl/debian-12-standard_12.12-1_amd64.tar.zst',
+    'storage': 'local-lvm',
+    'bridge': 'vmbr0',
+    'interface': 'eth0',
+    'disk_gb': 20,
+    'cores': 4,
+    'memory_mb': 3072,
+    'swap_mb': 512,
+    'node_major': 22,
+    'prepare': [],
+}
 MCP_LINE = re.compile(r'^(?P<name>.+?): .* - (?P<mark>[✔✘!⊘])')
 MCP_STATUS = {'✔': 'connected', '✘': 'failed', '!': 'needs login', '⊘': 'disabled'}
 
@@ -320,6 +337,167 @@ def editor_uri(user, address, workdir):
     return f'vscode-remote://ssh-remote+{user}@{address}{workdir}'
 
 
+def project_slug(name):
+    slug = re.sub(r'[^a-z0-9]+', '-', str(name).lower()).strip('-')[:40].strip('-')
+    if not slug:
+        raise DevkitError(f"'{name}' cannot be turned into a template name; set name = \"...\" in {PROJECT_CONFIG_NAME}")
+    return slug
+
+
+def template_settings(server):
+    return {**TEMPLATE_DEFAULTS, **server.get('template', {})}
+
+
+def choose_template(containers, slug=None, legacy=None):
+    templates = {c.get('name'): c for c in containers if c.get('template')}
+    wanted = ([PROJECT_TEMPLATE_PREFIX + slug] if slug else []) + [BASE_TEMPLATE]
+    for name in wanted:
+        if name in templates:
+            return int(templates[name]['vmid']), name
+    if legacy:
+        for container in containers:
+            if int(container['vmid']) == int(legacy) and container.get('template'):
+                return int(legacy), container.get('name') or str(legacy)
+    return None, None
+
+
+def blank_env(text):
+    lines = []
+    for line in text.splitlines():
+        match = ENV_LINE.match(line)
+        if match:
+            lines.append(f'{match.group(1)}=')
+    return '\n'.join(lines) + '\n'
+
+
+def environment_size(server, project):
+    merged = {**server.get('environment', {}), **(project or {}).get('environment', {})}
+    size = {}
+    if merged.get('memory_mb'):
+        size['memory'] = int(merged['memory_mb'])
+    if merged.get('cores'):
+        size['cores'] = int(merged['cores'])
+    return size
+
+
+def new_container_params(vmid, hostname, pool, settings, public_key):
+    return {
+        'vmid': vmid,
+        'hostname': hostname,
+        'pool': pool,
+        'ostemplate': settings['os_template'],
+        'rootfs': f"{settings['storage']}:{settings['disk_gb']}",
+        'cores': settings['cores'],
+        'memory': settings['memory_mb'],
+        'swap': settings['swap_mb'],
+        'unprivileged': 1,
+        'features': 'nesting=1',
+        'net0': f"name={settings['interface']},bridge={settings['bridge']},ip=dhcp,type=veth",
+        'ssh-public-keys': public_key,
+        'description': encode_template_description(),
+    }
+
+
+def provision_script(user, node_major):
+    return f'''set -e
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get -y -qq upgrade >/dev/null
+apt-get install -y -qq ca-certificates curl git gh make jq python3 sudo rsync openssh-server >/dev/null
+command -v docker >/dev/null || curl -fsSL https://get.docker.com | sh >/dev/null 2>&1
+id {user} >/dev/null 2>&1 || useradd -m -s /bin/bash {user}
+usermod -aG docker {user}
+install -d -m 700 -o {user} -g {user} /home/{user}/.ssh
+install -m 600 -o {user} -g {user} /root/.ssh/authorized_keys /home/{user}/.ssh/authorized_keys
+echo "{user} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/devkit
+chmod 440 /etc/sudoers.d/devkit
+if ! node --version 2>/dev/null | grep -q "^v{node_major}\\."; then
+  curl -fsSL https://deb.nodesource.com/setup_{node_major}.x | bash - >/dev/null 2>&1
+  apt-get install -y -qq nodejs >/dev/null
+fi
+if command -v uv >/dev/null; then
+  uv self update >/dev/null 2>&1 || true
+else
+  curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh >/dev/null 2>&1
+fi
+if [ ! -x /opt/google/chrome/chrome ]; then
+  curl -fsSLo /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+  apt-get install -y -qq /tmp/chrome.deb >/dev/null
+  rm -f /tmp/chrome.deb
+fi
+cat > /etc/systemd/system/ssh-hostkeys.service <<UNIT
+[Unit]
+Description=Generate SSH host keys on first boot
+Before=ssh.service
+ConditionPathExists=!/etc/ssh/ssh_host_ed25519_key
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/ssh-keygen -A
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl enable -q ssh-hostkeys.service
+echo "docker $(docker --version | cut -d, -f1 | cut -d" " -f3), node $(node --version), uv $(uv --version | cut -d" " -f2), chrome $(/opt/google/chrome/chrome --version 2>/dev/null | tail -1 | cut -d" " -f3)"
+'''
+
+
+CLAUDE_INSTALL = (
+    'if [ -x ~/.local/bin/claude ]; then ~/.local/bin/claude update >/dev/null 2>&1 || true; '
+    'else curl -fsSL https://claude.ai/install.sh | bash >/dev/null 2>&1; fi; '
+    '~/.local/bin/claude --version'
+)
+DOCKER_PULL = 'docker pull -q hello-world >/dev/null 2>&1'
+DOCKER_PROBE = 'docker run --rm hello-world >/dev/null 2>&1'
+CLAUDE_STATE = ('~/.claude', '~/.claude.json', '~/.devkit-secrets', '~/.devkit-runs')
+IDENTITY_WIPE = (
+    'apt-get clean; rm -f /etc/ssh/ssh_host_* /var/lib/dhcp/* /var/lib/dbus/machine-id; '
+    ': > /etc/machine-id; sync'
+)
+
+
+def root_step_commands(vmid):
+    return [
+        f"echo 'lxc.apparmor.profile: unconfined' >> /etc/pve/lxc/{vmid}.conf",
+        f'pct set {vmid} --features keyctl=1,nesting=1',
+        f'pct reboot {vmid}',
+    ]
+
+
+def shell_path(path):
+    if path.startswith('~/'):
+        return '"$HOME"/' + shlex.quote(path[2:])
+    return shlex.quote(path)
+
+
+def leftover_check(paths):
+    tests = ' '.join(f'[ ! -e {shell_path(path)} ] &&' for path in paths)
+    return f'{tests} echo clean'
+
+
+REMOVE_CONTAINERS = 'docker ps -aq | xargs -r docker rm -f >/dev/null; true'
+
+
+def remove_files_script(paths):
+    return 'rm -rf ' + ' '.join(shell_path(path) for path in paths)
+
+
+def prepare_commands(value, where):
+    if value is None:
+        return []
+    if not isinstance(value, list) or not all(isinstance(item, str) and item.strip() for item in value):
+        raise DevkitError(f'{where}: prepare must be a list of commands, like prepare = ["make deps"]')
+    return value
+
+
+def encode_template_description(repo=None):
+    return 'devkit template' + (f' repo={repo}' if repo else '')
+
+
+def decode_template_repo(description):
+    match = re.search(r'devkit template repo=(\S+)', urllib.parse.unquote(description or ''))
+    return match.group(1) if match else None
+
+
 def encode_description(branch):
     return f'devkit branch={branch}'
 
@@ -346,9 +524,10 @@ def load_toml(path):
 
 class Proxmox:
 
-    def __init__(self, config, token):
+    def __init__(self, config, token, interface='eth0'):
         self.base = f"https://{config['host']}:{config.get('port', 8006)}/api2/json"
         self.node = config['node']
+        self.interface = interface
         self.token = token
         self.context = ssl.create_default_context()
         if not config.get('verify_tls', False):
@@ -407,7 +586,7 @@ class Proxmox:
         deadline = time.time() + timeout
         while time.time() < deadline:
             for interface in self.call('GET', f'/nodes/{self.node}/lxc/{vmid}/interfaces') or []:
-                if interface.get('name') == 'eth0' and interface.get('inet'):
+                if interface.get('name') == self.interface and interface.get('inet'):
                     return interface['inet'].split('/')[0]
             time.sleep(0.5)
         raise DevkitError(f'container {vmid} got no network address')
@@ -419,7 +598,31 @@ class Proxmox:
         ))
 
     def set_network(self, vmid, net0):
-        self.call('PUT', f'/nodes/{self.node}/lxc/{vmid}/config', net0=net0)
+        self.set_config(vmid, net0=net0)
+
+    def set_config(self, vmid, **params):
+        self.call('PUT', f'/nodes/{self.node}/lxc/{vmid}/config', **params)
+
+    def create(self, **params):
+        self.wait(self.call('POST', f'/nodes/{self.node}/lxc', **params), timeout=600)
+
+    def to_template(self, vmid):
+        self.call('POST', f'/nodes/{self.node}/lxc/{vmid}/template')
+
+    def templates(self):
+        return sorted((c for c in self.containers() if c.get('template')), key=lambda c: c['vmid'])
+
+    def named(self, name):
+        return [c for c in self.containers() if c.get('name') == name]
+
+    def ensure_os_template(self, volid):
+        storage, _, path = volid.partition(':')
+        filename = path.rsplit('/', 1)[-1]
+        content = self.call('GET', f'/nodes/{self.node}/storage/{storage}/content?content=vztmpl') or []
+        if any(item.get('volid') == volid for item in content):
+            return False
+        self.wait(self.call('POST', f'/nodes/{self.node}/aplinfo', storage=storage, template=filename), timeout=900)
+        return True
 
     def start(self, vmid):
         self.wait(self.call('POST', f'/nodes/{self.node}/lxc/{vmid}/status/start'))
@@ -481,6 +684,14 @@ class Remote:
             time.sleep(0.5)
         raise DevkitError(f'{self.target} did not accept SSH')
 
+    def succeeds(self, script):
+        return subprocess.run(self.command(script), capture_output=True).returncode == 0
+
+    def stream(self, script, stdin=None, forward=False, env=None, label=None):
+        result = subprocess.run(self.command(script, forward=forward), input=stdin, text=True, env=env)
+        if result.returncode != 0:
+            raise DevkitError(f'step failed with exit {result.returncode}: {label or script.splitlines()[0][:80]}')
+
 
 class Agent:
 
@@ -506,24 +717,66 @@ class Agent:
             self.pid = None
 
 
+@contextlib.contextmanager
+def file_lock(path, wait_seconds, busy):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.time() + wait_seconds
+    with open(path, 'w') as lock:
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.time() >= deadline:
+                    raise DevkitError(busy) from None
+                time.sleep(1)
+        yield
+
+
+def clone_lock(wait_seconds=0):
+    return file_lock(LOCK_PATH, wait_seconds, 'another create or template build is using the server, try again in a moment')
+
+
+def build_lock(build_name):
+    return file_lock(
+        LOCK_PATH.with_name(f'{build_name}.lock'), 0, f'a build of this template is already running ({build_name})',
+    )
+
+
 class Devkit:
 
-    def __init__(self, project_dir):
+    def __init__(self, project_dir, need_project=True):
         self.server = load_toml(SERVER_CONFIG)
-        self.project_config_path = find_project_config(project_dir)
         variables = {name: str(value) for name, value in self.server.get('variables', {}).items()}
-        self.project = expand(load_toml(self.project_config_path), variables)
-        self.project_root = self.project_config_path.parent
+        try:
+            self.project_config_path = find_project_config(project_dir)
+        except DevkitError:
+            if need_project:
+                raise
+            self.project_config_path = None
+        if self.project_config_path:
+            self.project = expand(load_toml(self.project_config_path), variables)
+            self.project_root = self.project_config_path.parent
+        else:
+            self.project = None
+            self.project_root = None
         secrets_path = Path(self.server['secrets']['file']).expanduser()
         self.secrets_text = secrets_path.read_text()
         token = read_env_value(self.secrets_text, self.server['secrets']['proxmox_token_key'])
         if not token:
             raise DevkitError(f"{self.server['secrets']['proxmox_token_key']} not found in {secrets_path}")
-        self.proxmox = Proxmox(self.server['proxmox'], token)
+        self.template = template_settings(self.server)
+        self.proxmox = Proxmox(self.server['proxmox'], token, self.template['interface'])
         self.user = self.server['ssh']['user']
         self.key = self.server['ssh']['key']
         self.github_key = self.server['ssh']['github_key']
-        self.workdir = self.project['workdir']
+        self.workdir = self.project['workdir'] if self.project else None
+        self.slug = None
+        if self.project:
+            try:
+                self.slug = project_slug(self.project.get('name') or self.project_root.name)
+            except DevkitError:
+                self.slug = None
 
     def remote(self, vmid):
         return Remote(self.proxmox.address(vmid), self.user, self.key)
@@ -531,12 +784,7 @@ class Devkit:
     def create(self, name, branch, check=True):
         validate_name(name)
         branch = branch or name
-        LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with open(LOCK_PATH, 'w') as lock:
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                raise DevkitError('another create is running, try again in a moment') from None
+        with clone_lock():
             self._create(name, branch, check)
 
     def _create(self, name, branch, check=True):
@@ -545,23 +793,23 @@ class Devkit:
             raise DevkitError(f"environment '{name}' already exists")
         self._require_room(existing)
         self._require_memory()
+        template, template_name = self._template_for_project()
         vmid = self.proxmox.next_id()
         started = time.time()
         here = {}
         probe = threading.Thread(target=lambda: here.update(self._tool_servers_here()), daemon=True)
         if check:
             probe.start()
-        step(f'cloning template into container {vmid}')
+        step(f'cloning {template_name} into container {vmid}')
         self.proxmox.clone(
-            self.server['proxmox']['template'], vmid, ENV_PREFIX + name,
+            template, vmid, ENV_PREFIX + name,
             self.server['proxmox']['pool'], encode_description(branch),
         )
         try:
-            network = self.server.get('network')
-            if network:
-                self.proxmox.set_network(
-                    vmid, static_network(self.proxmox.config(vmid)['net0'], vmid, network),
-                )
+            self._apply_network(vmid)
+            size = environment_size(self.server, self.project)
+            if size:
+                self.proxmox.set_config(vmid, **size)
             self.proxmox.start(vmid)
             remote = self.remote(vmid)
             remote.wait()
@@ -594,6 +842,10 @@ class Devkit:
         repo = self.project['repo']
         base = self.project['base_branch']
         script = f'''set -e
+if [ ! -d {shlex.quote(self.workdir)}/.git ]; then
+  mkdir -p "$(dirname {shlex.quote(self.workdir)})"
+  GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=accept-new" git clone -q {shlex.quote(repo)} {shlex.quote(self.workdir)}
+fi
 cd {shlex.quote(self.workdir)}
 git config core.sshCommand "ssh -o StrictHostKeyChecking=accept-new"
 git remote remove origin 2>/dev/null || true
@@ -610,17 +862,47 @@ git log --oneline -1
         with Agent(self.github_key) as env:
             remote.run(script, forward=True, env=env)
 
-    def _push_settings(self, remote):
-        settings = self.project.get('settings', {})
-        source = (self.project_root / settings.get('source', '.env')).read_text()
-        drop = self._always_dropped() | set(settings.get('drop', ()))
-        for unused in unmatched_replacements(source, drop, settings.get('force'), settings.get('replace')):
-            step(f"warning: replace rule '{unused}' matched nothing in {settings.get('source', '.env')}")
-        rewritten = rewrite_env(
-            source, drop=drop, force=settings.get('force'), replace=settings.get('replace'),
+    def _template_for_project(self):
+        template, name = choose_template(
+            self.proxmox.containers(), self.slug, self.server['proxmox'].get('template'),
         )
-        target = shlex.quote(f"{self.workdir}/{settings.get('target', '.env')}")
-        remote.run(f'umask 077; cat > {target}', stdin=rewritten)
+        if template is None:
+            raise DevkitError('no template on the server yet; build one with: devkit template build')
+        if name.startswith(PROJECT_TEMPLATE_PREFIX):
+            self._require_same_repo(template, name)
+        return template, name
+
+    def _require_same_repo(self, vmid, name):
+        built_for = decode_template_repo(self.proxmox.config(vmid).get('description'))
+        if built_for and built_for != self.project['repo']:
+            raise DevkitError(
+                f"{name} was built for {built_for}, not for this project; "
+                f'give this project its own name = "..." in {PROJECT_CONFIG_NAME}'
+            )
+
+    def _apply_network(self, vmid):
+        network = self.server.get('network')
+        if network:
+            self.proxmox.set_network(vmid, static_network(self.proxmox.config(vmid)['net0'], vmid, network))
+
+    def _settings_target(self):
+        return f"{self.workdir}/{self.project.get('settings', {}).get('target', '.env')}"
+
+    def _rewritten_settings(self, warn=True):
+        settings = self.project.get('settings', {})
+        source_path = self.project_root / settings.get('source', '.env')
+        if not source_path.is_file():
+            raise DevkitError(f'the settings file {source_path} does not exist')
+        source = source_path.read_text()
+        drop = self._always_dropped() | set(settings.get('drop', ()))
+        if warn:
+            for unused in unmatched_replacements(source, drop, settings.get('force'), settings.get('replace')):
+                step(f"warning: replace rule '{unused}' matched nothing in {settings.get('source', '.env')}")
+        return rewrite_env(source, drop=drop, force=settings.get('force'), replace=settings.get('replace'))
+
+    def _push_settings(self, remote):
+        target = shlex.quote(self._settings_target())
+        remote.run(f'umask 077; cat > {target}', stdin=self._rewritten_settings())
 
         exports, servers, skipped = resolve_tool_servers(
             self.project.get('tool_servers'), self.secrets_text,
@@ -637,6 +919,12 @@ git log --oneline -1
             f'sed -i \'1i [ -f {SECRETS_FILE} ] && . {SECRETS_FILE}\' ~/.bashrc',
             stdin=render_exports(exports),
         )
+        self._trust_workspace(remote, servers)
+        note = self.project.get('note')
+        if note:
+            remote.run(f'cat > {shlex.quote(self.workdir + "/" + NOTE_FILE)}', stdin=note.strip() + '\n')
+
+    def _trust_workspace(self, remote, servers):
         claude_config = (
             'import json, os\n'
             'path = os.path.expanduser("~/.claude.json")\n'
@@ -649,9 +937,6 @@ git log --oneline -1
             'json.dump(data, open(path, "w"))\n'
         )
         remote.run('python3 -', stdin=claude_config)
-        note = self.project.get('note')
-        if note:
-            remote.run(f'cat > {shlex.quote(self.workdir + "/" + NOTE_FILE)}', stdin=note.strip() + '\n')
 
     def _share_host_key(self, remote):
         configured = self.server['ssh'].get('host_key')
@@ -1008,6 +1293,231 @@ git log --oneline -1
                 pass
         self.proxmox.delete(vmid)
 
+    def template_list(self):
+        templates = [
+            c for c in self.proxmox.templates()
+            if c.get('name') == BASE_TEMPLATE or c.get('name', '').startswith(PROJECT_TEMPLATE_PREFIX)
+        ]
+        legacy = self.server['proxmox'].get('template')
+        if not templates and not legacy:
+            print('no templates; build one with: devkit template build')
+            return
+        rows = [('TEMPLATE', 'CONTAINER', 'FOR')]
+        for container in templates:
+            name = container['name']
+            purpose = 'every project' if name == BASE_TEMPLATE else name[len(PROJECT_TEMPLATE_PREFIX):]
+            rows.append((name, str(container['vmid']), purpose))
+        widths = [max(len(row[i]) for row in rows) for i in range(3)]
+        for row in rows if templates else []:
+            print('  '.join(cell.ljust(width) for cell, width in zip(row, widths)).rstrip())
+        for container in self._leftover_builds():
+            print(f"leftover from a failed build: {container['name']} (container {container['vmid']}); "
+                  'remove it with: devkit template clean')
+        if self.slug:
+            _, chosen = choose_template(self.proxmox.containers(), self.slug, legacy)
+            print(f'\n{self.slug} uses: {chosen or "nothing yet"}')
+        if legacy:
+            print(f'[proxmox] template = {legacy} is still set; it is only used when no named template exists')
+
+    def _leftover_builds(self):
+        return [
+            c for c in self.proxmox.containers()
+            if c.get('name', '').startswith(BUILD_PREFIX) and not c.get('template')
+        ]
+
+    def template_clean(self):
+        leftovers = self._leftover_builds()
+        if not leftovers:
+            print('nothing to clean')
+            return 0
+        for container in leftovers:
+            with build_lock(container['name']):
+                self._remove(container['vmid'], running=container['status'] == 'running')
+            print(f"removed {container['name']} (container {container['vmid']})")
+        return 0
+
+    def template_build(self, base=False, fresh=False):
+        if fresh and not (base or self.project is None):
+            raise DevkitError('--fresh rebuilds the base from the OS image; use it with --base')
+        if base or self.project is None:
+            return self._build_base(fresh)
+        if not self.slug:
+            raise DevkitError(f'this folder name cannot name a template; set name = "..." in {PROJECT_CONFIG_NAME}')
+        if not self._frozen(BASE_TEMPLATE):
+            step('no base template yet, building it first')
+            self._build_base(fresh)
+        return self._build_project()
+
+    def _frozen(self, name):
+        return [c for c in self.proxmox.named(name) if c.get('template')]
+
+    def _recover_or_discard(self, build_name, final_name):
+        for container in self.proxmox.named(build_name):
+            if container.get('template') and not self._frozen(final_name):
+                step(f'finishing an interrupted build: container {container["vmid"]} becomes {final_name}')
+                self.proxmox.set_config(container['vmid'], hostname=final_name)
+            elif container.get('template'):
+                self.proxmox.delete(container['vmid'])
+            else:
+                step(f'removing a leftover build container ({container["vmid"]})')
+                self._remove(container['vmid'], running=container['status'] == 'running')
+
+    def _start_build(self, vmid):
+        self._apply_network(vmid)
+        self.proxmox.start(vmid)
+        address = self.proxmox.address(vmid)
+        root = Remote(address, 'root', self.key)
+        root.wait()
+        return root, Remote(address, self.user, self.key)
+
+    def _abandon(self, vmid, build_name):
+        try:
+            self.proxmox.stop(vmid)
+        except DevkitError:
+            pass
+        step(f'build failed; container {vmid} ({build_name}) is stopped and kept for inspection; '
+             'the next build of this template removes it, or run: devkit template clean')
+
+    def _freeze(self, vmid, root, final_name):
+        root.run(IDENTITY_WIPE)
+        self.proxmox.shutdown(vmid)
+        with clone_lock(wait_seconds=300):
+            self.proxmox.to_template(vmid)
+            deadline = time.time() + 60
+            while not any(c.get('template') and int(c['vmid']) == int(vmid) for c in self.proxmox.containers()):
+                if time.time() >= deadline:
+                    raise DevkitError(f'container {vmid} was frozen but the server does not list it as a template')
+                time.sleep(1)
+            for old in self.proxmox.named(final_name):
+                step(f'replacing the previous {final_name} ({old["vmid"]})')
+                self.proxmox.delete(old['vmid'])
+            self.proxmox.set_config(vmid, hostname=final_name)
+
+    def _docker_works(self, root, vmid):
+        if root.succeeds(DOCKER_PROBE):
+            return
+        if not root.succeeds(DOCKER_PULL):
+            raise DevkitError(
+                'the build container cannot pull the hello-world image; check its network and Docker Hub access'
+            )
+        print()
+        print('  Docker cannot start containers inside this container yet.')
+        print('  Proxmox only lets root change that. On the Proxmox server, as root, run:')
+        print()
+        for command in root_step_commands(vmid):
+            print(f'    {command}')
+        print()
+        step('waiting for those three commands (up to 30 minutes)')
+        deadline = time.time() + ROOT_STEP_TIMEOUT
+        while time.time() < deadline:
+            time.sleep(10)
+            if root.succeeds(DOCKER_PROBE):
+                step('Docker works now')
+                return
+        raise DevkitError('Docker still cannot start containers after 30 minutes')
+
+    def _build_base(self, fresh=False):
+        settings = self.template
+        prepare = prepare_commands(settings['prepare'], '[template] in the server config')
+        build_name = BUILD_PREFIX + 'base'
+        with build_lock(build_name):
+            started = time.time()
+            self._recover_or_discard(build_name, BASE_TEMPLATE)
+            current = self._frozen(BASE_TEMPLATE)
+            with clone_lock(wait_seconds=300):
+                vmid = self.proxmox.next_id()
+                if current and not fresh:
+                    step(f'updating {BASE_TEMPLATE}: cloning it into container {vmid}')
+                    self.proxmox.clone(
+                        current[0]['vmid'], vmid, build_name, self.server['proxmox']['pool'],
+                        encode_template_description(),
+                    )
+                else:
+                    public_key = Path(str(Path(self.key).expanduser()) + '.pub').read_text().strip()
+                    if self.proxmox.ensure_os_template(settings['os_template']):
+                        step(f"downloaded {settings['os_template']}")
+                    step(f"creating container {vmid} from {settings['os_template'].rsplit('/', 1)[-1]}")
+                    self.proxmox.create(**new_container_params(
+                        vmid, build_name, self.server['proxmox']['pool'], settings, public_key,
+                    ))
+            try:
+                root, user = self._start_build(vmid)
+                step('installing or updating Docker, Node, uv, Chrome and the tools')
+                root.stream('bash -s', stdin=provision_script(self.user, settings['node_major']), label='provisioning')
+                user.wait()
+                step('installing or updating Claude Code')
+                user.stream(CLAUDE_INSTALL, label='installing Claude Code')
+                self._docker_works(root, vmid)
+                for command in prepare:
+                    step(f'prepare: {command[:70]}')
+                    user.stream(f'export PATH="$HOME/.local/bin:$PATH"; {command}', label=command)
+                root.run(REMOVE_CONTAINERS)
+                root.run('docker image rm -f hello-world >/dev/null 2>&1 || true')
+                step('freezing')
+                self._freeze(vmid, root, BASE_TEMPLATE)
+            except BaseException:
+                self._abandon(vmid, build_name)
+                raise
+            print(f'\n{BASE_TEMPLATE} ready in {time.time() - started:.0f}s (container {vmid})')
+            return 0
+
+    def _build_project(self):
+        final_name = PROJECT_TEMPLATE_PREFIX + self.slug
+        build_name = BUILD_PREFIX + 'tpl-' + self.slug
+        prepare = prepare_commands(
+            self.project.get('template', {}).get('prepare'), f'[template] in {PROJECT_CONFIG_NAME}',
+        )
+        blank_settings = blank_env(self._rewritten_settings(warn=False))
+        target = self._settings_target()
+        with build_lock(build_name):
+            started = time.time()
+            for existing in self._frozen(final_name):
+                self._require_same_repo(existing['vmid'], final_name)
+            self._recover_or_discard(build_name, final_name)
+            base = self._frozen(BASE_TEMPLATE)
+            if not base:
+                raise DevkitError(f'{BASE_TEMPLATE} is missing; build it with: devkit template build --base')
+            with clone_lock(wait_seconds=300):
+                vmid = self.proxmox.next_id()
+                step(f'cloning {BASE_TEMPLATE} into container {vmid}')
+                self.proxmox.clone(
+                    base[0]['vmid'], vmid, build_name, self.server['proxmox']['pool'],
+                    encode_template_description(self.project['repo']),
+                )
+            try:
+                root, user = self._start_build(vmid)
+                user.wait()
+                step(f"cloning {self.project['repo']} at {self.project['base_branch']}")
+                self._checkout(user, self.project['base_branch'])
+                user.run(f'umask 077; cat > {shlex.quote(target)}', stdin=blank_settings)
+                for command in prepare:
+                    step(f'prepare: {command[:70]}')
+                    user.stream(
+                        f'export PATH="$HOME/.local/bin:$PATH"; cd {shlex.quote(self.workdir)} && {command}',
+                        label=command,
+                    )
+                if self.server.get('claude', {}).get('mirror', True):
+                    step('warming up the Claude tool servers')
+                    self._mirror_claude(user)
+                    self._trust_workspace(user, {})
+                    user.succeeds(
+                        f'export PATH="$HOME/.local/bin:$PATH"; cd {shlex.quote(self.workdir)} '
+                        '&& timeout 240 claude mcp list'
+                    )
+                user.run(f'cd {shlex.quote(self.workdir)} && git checkout -q -- . 2>/dev/null; true')
+                user.run(remove_files_script((target, *CLAUDE_STATE)))
+                user.run(REMOVE_CONTAINERS)
+                if user.run(leftover_check((target, *CLAUDE_STATE))).strip() != 'clean':
+                    raise DevkitError('settings or Claude files are still inside the build container; not freezing it')
+                step('freezing')
+                self._freeze(vmid, root, final_name)
+            except BaseException:
+                self._abandon(vmid, build_name)
+                raise
+            print(f'\n{final_name} ready in {time.time() - started:.0f}s (container {vmid})')
+            print(f'  new environments for {self.slug} start from it')
+            return 0
+
 
 def format_age(seconds):
     if seconds < 3600:
@@ -1026,7 +1536,7 @@ COMMAND_LINK = Path('~/.local/bin/devkit').expanduser()
 CLAUDE_SETTINGS = CLAUDE_HOME / 'settings.json'
 PERMITTED_COMMANDS = ('create', 'list', 'check', 'task', 'report', 'ssh', 'claude', 'code', 'stop', 'start')
 REQUIRED_SERVER_KEYS = (
-    ('proxmox', 'host'), ('proxmox', 'node'), ('proxmox', 'pool'), ('proxmox', 'template'),
+    ('proxmox', 'host'), ('proxmox', 'node'), ('proxmox', 'pool'),
     ('limits', 'max_environments'),
     ('ssh', 'user'), ('ssh', 'key'), ('ssh', 'github_key'),
     ('secrets', 'file'), ('secrets', 'proxmox_token_key'),
@@ -1035,7 +1545,14 @@ SERVER_CONFIG_TEMPLATE = '''[proxmox]
 host = ""
 node = ""
 pool = "devkit"
-template = 0
+
+[template]
+os_template = "local:vztmpl/debian-12-standard_12.12-1_amd64.tar.zst"
+storage = "local-lvm"
+bridge = "vmbr0"
+disk_gb = 20
+cores = 4
+memory_mb = 3072
 
 [limits]
 max_environments = 3
@@ -1224,10 +1741,7 @@ class Setup:
             subprocess.run(
                 ['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-C', 'devkit', '-f', str(key)], check=True,
             )
-            self.needs_you(
-                'environment SSH key',
-                f'created {key}; its public half must be in the template (see TEMPLATE.md)',
-            )
+            self.done('environment SSH key', f'created {key}; templates built from now on accept it')
         github_key = Path(server['ssh']['github_key']).expanduser()
         if github_key.exists():
             self.ok('GitHub SSH key')
@@ -1259,14 +1773,20 @@ class Setup:
             self.needs_you('Proxmox access', str(error))
             return
         self.ok('Proxmox access')
-        template = server['proxmox']['template']
-        match = [c for c in containers if int(c['vmid']) == int(template)]
-        if match and match[0].get('template'):
-            self.ok('template', f"container {template} ({match[0].get('name', '')})")
-        elif match:
-            self.needs_you('template', f'container {template} exists but is not a template')
+        slug = None
+        if self.project_root is not None:
+            try:
+                project = load_toml(self.project_root / PROJECT_CONFIG_NAME)
+                slug = project_slug(project.get('name') or self.project_root.name)
+            except (DevkitError, tomllib.TOMLDecodeError):
+                slug = None
+        _, name = choose_template(containers, slug, server['proxmox'].get('template'))
+        if name is None:
+            self.needs_you('template', 'none on the server yet; build one with: devkit template build')
+        elif slug and name != PROJECT_TEMPLATE_PREFIX + slug:
+            self.ok('template', f'{name}; `devkit template build` here makes one with {slug} prepared inside')
         else:
-            self.needs_you('template', f'container {template} is not visible to the token; build one (see TEMPLATE.md)')
+            self.ok('template', name)
 
 
 def build_parser():
@@ -1274,6 +1794,15 @@ def build_parser():
     parser.add_argument('-C', dest='project_dir', default='.', help='project folder holding .devkit.toml')
     commands = parser.add_subparsers(dest='command', required=True)
     commands.add_parser('setup', help='install devkit on this machine and report what is missing')
+    template = commands.add_parser('template', help='build or list the templates environments start from')
+    template_actions = template.add_subparsers(dest='template_action', required=True)
+    build = template_actions.add_parser(
+        'build', help="inside a project: that project's template; elsewhere: the base template",
+    )
+    build.add_argument('--base', action='store_true', help='build or update the base template')
+    build.add_argument('--fresh', action='store_true', help='start the base from the OS image, not from the current base')
+    template_actions.add_parser('list', help='list templates')
+    template_actions.add_parser('clean', help='remove containers left by failed builds')
     create = commands.add_parser('create', help='create an environment')
     create.add_argument('name')
     create.add_argument('branch', nargs='?', help='defaults to the name')
@@ -1323,6 +1852,13 @@ def main(argv=None):
     try:
         if arguments.command == 'setup':
             return Setup(Path(arguments.project_dir).resolve()).run()
+        if arguments.command == 'template':
+            devkit = Devkit(Path(arguments.project_dir).resolve(), need_project=False)
+            if arguments.template_action == 'list':
+                return devkit.template_list()
+            if arguments.template_action == 'clean':
+                return devkit.template_clean()
+            return devkit.template_build(base=arguments.base, fresh=arguments.fresh)
         devkit = Devkit(Path(arguments.project_dir).resolve())
         if arguments.command == 'create':
             devkit.create(arguments.name, arguments.branch, check=not arguments.no_check)

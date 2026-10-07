@@ -38,7 +38,7 @@
 - Server settings in `~/.config/devkit/config.toml`
 - Server values as placeholders in the app config, no addresses written in it
 - `setting-up-devkit` skill: writes and checks an app's `.devkit.toml`
-- Template built by hand, steps in `TEMPLATE.md`
+- Template built by hand, steps in `TEMPLATE.md` (replaced by `template build` in 0.2)
 - Shared dev MySQL, MongoDB and Qdrant
 - Single Python file, standard library only
 - State read from Proxmox, no state file
@@ -92,11 +92,24 @@
 - Owner recorded per environment: person or Claude session
 - Doctor command: Proxmox access, memory, template, network
 
-### Template
-- `template build` command
-- Slim app image, pulled or built during template build
-- Identity wipe automated: machine id, SSH host keys, network lease
-- Rebuild on a schedule or on demand
+### Templates (done)
+- `template build`: base from the OS image, or updated by cloning the current base
+- `template build` inside a project: that project's template, prepared by commands in its `.devkit.toml`
+- `template list`
+- Templates found by name, no template number in the config
+- A project without its own template starts from the base and clones its repo
+- Base size, storage, bridge, OS image and Node version in the server config
+- Environment memory and cores per server and per project
+- Root step detected by the build, printed with the right container number, and waited for
+- No secret and no Claude setup frozen into a template
+- New template frozen before the old one is removed; an interrupted build is finished by the next
+- One build per template at a time; builds and creates share one lock
+- `template clean` for containers left by failed builds
+- A template refused when it was built for a different repository
+
+### Templates, still open
+- Rebuild on a schedule
+- A check that warns when a project template is older than the project's dependency files
 
 ### Git
 - Dedicated GitHub token for the app, replacing SSH agent forwarding

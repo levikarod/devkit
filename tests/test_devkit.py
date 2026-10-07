@@ -321,7 +321,7 @@ class TestSetup(unittest.TestCase):
         import tomllib
         missing = devkit.missing_server_keys(tomllib.loads(devkit.SERVER_CONFIG_TEMPLATE))
         self.assertEqual(missing, [
-            '[proxmox] host', '[proxmox] node', '[proxmox] template', '[secrets] file',
+            '[proxmox] host', '[proxmox] node', '[secrets] file',
         ])
 
     def test_a_complete_server_config_reports_nothing(self):
@@ -332,6 +332,265 @@ class TestSetup(unittest.TestCase):
             'secrets': {'file': 'f', 'proxmox_token_key': 'T'},
         }
         self.assertEqual(devkit.missing_server_keys(config), [])
+
+
+class TestTemplates(unittest.TestCase):
+
+    CONTAINERS = [
+        {'vmid': 105, 'name': 'devkit-template-v6', 'template': 1},
+        {'vmid': 110, 'name': 'devkit-base', 'template': 1},
+        {'vmid': 111, 'name': 'devkit-tpl-droppo-v2', 'template': 1},
+        {'vmid': 112, 'name': 'devkit-tpl-other', 'template': 0},
+        {'vmid': 104, 'name': 'env-fix', 'template': 0},
+    ]
+
+    def test_a_project_template_wins_over_the_base(self):
+        self.assertEqual(devkit.choose_template(self.CONTAINERS, 'droppo-v2'), (111, 'devkit-tpl-droppo-v2'))
+
+    def test_a_project_without_its_own_template_gets_the_base(self):
+        self.assertEqual(devkit.choose_template(self.CONTAINERS, 'landing'), (110, 'devkit-base'))
+
+    def test_a_container_that_is_not_frozen_is_never_chosen(self):
+        self.assertEqual(devkit.choose_template(self.CONTAINERS, 'other'), (110, 'devkit-base'))
+
+    def test_the_old_numbered_template_is_only_a_last_resort(self):
+        only_old = [self.CONTAINERS[0]]
+        self.assertEqual(devkit.choose_template(only_old, 'droppo-v2', legacy=105), (105, 'devkit-template-v6'))
+        self.assertEqual(devkit.choose_template(self.CONTAINERS, 'droppo-v2', legacy=105)[0], 111)
+
+    def test_no_template_at_all_is_none(self):
+        self.assertEqual(devkit.choose_template([self.CONTAINERS[4]], 'x'), (None, None))
+        self.assertEqual(devkit.choose_template([self.CONTAINERS[4]], 'x', legacy=999), (None, None))
+
+    def test_slugs_are_safe_container_names(self):
+        self.assertEqual(devkit.project_slug('Droppo_v2'), 'droppo-v2')
+        self.assertEqual(devkit.project_slug('my.app (new)'), 'my-app-new')
+        with self.assertRaises(devkit.DevkitError):
+            devkit.project_slug('___')
+
+    def test_settings_default_and_override(self):
+        settings = devkit.template_settings({'template': {'memory_mb': 4096}})
+        self.assertEqual(settings['memory_mb'], 4096)
+        self.assertEqual(settings['cores'], devkit.TEMPLATE_DEFAULTS['cores'])
+        self.assertEqual(devkit.template_settings({}), devkit.TEMPLATE_DEFAULTS)
+
+    def test_a_new_container_is_unprivileged_and_carries_only_the_public_key(self):
+        params = devkit.new_container_params(120, 'devkit-build-base', 'devkit', devkit.TEMPLATE_DEFAULTS, 'ssh-ed25519 AAA devkit')
+        self.assertEqual(params['unprivileged'], 1)
+        self.assertEqual(params['rootfs'], 'local-lvm:20')
+        self.assertEqual(params['net0'], 'name=eth0,bridge=vmbr0,ip=dhcp,type=veth')
+        self.assertEqual(params['ssh-public-keys'], 'ssh-ed25519 AAA devkit')
+
+    def test_build_settings_keep_every_key_and_no_value(self):
+        text = '# c\nA=secret\nB="x y"\n\nC=\n'
+        self.assertEqual(devkit.blank_env(text), 'A=\nB=\nC=\n')
+        self.assertNotIn('secret', devkit.blank_env(text))
+
+    def test_environment_size_comes_from_the_project_first(self):
+        server = {'environment': {'memory_mb': 3072, 'cores': 4}}
+        self.assertEqual(devkit.environment_size(server, {'environment': {'memory_mb': 6144}}), {'memory': 6144, 'cores': 4})
+        self.assertEqual(devkit.environment_size({}, {}), {})
+        self.assertEqual(devkit.environment_size({}, None), {})
+
+    def test_provisioning_is_for_the_configured_user_and_node(self):
+        script = devkit.provision_script('builder', 20)
+        self.assertIn('useradd -m -s /bin/bash builder', script)
+        self.assertIn('setup_20.x', script)
+        self.assertIn('grep -q "^v20\\."', script)
+        self.assertNotIn('{', script.replace('${', ''))
+
+    def test_the_root_step_names_the_container(self):
+        commands = devkit.root_step_commands(121)
+        self.assertIn('/etc/pve/lxc/121.conf', commands[0])
+        self.assertEqual(commands[2], 'pct reboot 121')
+
+    def run_shell(self, script, home):
+        import os
+        import subprocess
+        tools = os.path.join(home, '.test-bin')
+        os.makedirs(tools, exist_ok=True)
+        for name in ('rm', 'sh', 'echo', '['):
+            link = os.path.join(tools, name)
+            if not os.path.exists(link):
+                os.symlink(os.path.join('/usr/bin', name), link)
+        return subprocess.run(['/bin/sh', '-c', script], env={'HOME': home, 'PATH': tools},
+                              capture_output=True, text=True)
+
+    def test_the_leftover_check_only_says_clean_when_nothing_is_there(self):
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as home:
+            spaced = os.path.join(home, 'my project', '.env')
+            check = devkit.leftover_check((spaced, '~/.claude', '~/.claude.json'))
+            self.assertEqual(self.run_shell(check, home).stdout.strip(), 'clean')
+            os.makedirs(os.path.dirname(spaced))
+            open(spaced, 'w').close()
+            self.assertEqual(self.run_shell(check, home).stdout.strip(), '')
+            os.remove(spaced)
+            os.makedirs(os.path.join(home, '.claude'))
+            self.assertEqual(self.run_shell(check, home).stdout.strip(), '')
+
+    def test_cleanup_removes_the_settings_file_and_everything_the_mirror_wrote(self):
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as home:
+            workdir = os.path.join(home, 'my project')
+            os.makedirs(workdir)
+            target = os.path.join(workdir, '.env')
+            os.makedirs(os.path.join(home, '.claude'))
+            files = [target, os.path.join(home, '.claude.json'), os.path.join(home, '.devkit-secrets')]
+            files += [os.path.join(home, '.claude', item) for item in devkit.MIRRORED]
+            for path in files:
+                with open(path, 'w') as handle:
+                    handle.write('A=secret\n')
+            script = devkit.remove_files_script((target, *devkit.CLAUDE_STATE))
+            self.assertTrue(script.startswith('rm -rf '))
+            for forbidden in ('docker', 'git', ';', '|', '&'):
+                self.assertNotIn(forbidden, script)
+            self.run_shell(script, home)
+            self.assertFalse(os.path.exists(target))
+            for leftover in ('.claude', '.claude.json', '.devkit-secrets'):
+                self.assertFalse(os.path.exists(os.path.join(home, leftover)), leftover)
+            check = devkit.leftover_check((target, *devkit.CLAUDE_STATE))
+            self.assertEqual(self.run_shell(check, home).stdout.strip(), 'clean')
+
+    def test_every_mirrored_item_lives_under_a_path_the_cleanup_removes(self):
+        self.assertIn('~/.claude', devkit.CLAUDE_STATE)
+
+    def test_prepare_must_be_a_list_of_commands(self):
+        self.assertEqual(devkit.prepare_commands(None, 'x'), [])
+        self.assertEqual(devkit.prepare_commands(['make deps'], 'x'), ['make deps'])
+        for wrong in ('make deps', ['ok', 3], ['']):
+            with self.assertRaises(devkit.DevkitError):
+                devkit.prepare_commands(wrong, 'x')
+
+    def test_sudo_works_for_a_user_name_with_a_dot(self):
+        script = devkit.provision_script('john.doe', 22)
+        self.assertIn('> /etc/sudoers.d/devkit', script)
+        self.assertNotIn('/etc/sudoers.d/john.doe', script)
+
+    def test_an_update_upgrades_what_is_already_installed(self):
+        script = devkit.provision_script('dev', 22)
+        self.assertIn('apt-get -y -qq upgrade', script)
+        self.assertIn('uv self update', script)
+        self.assertIn('claude update', devkit.CLAUDE_INSTALL)
+
+    def test_a_template_remembers_the_repository_it_was_built_for(self):
+        description = devkit.encode_template_description('git@github.com:o/app.git')
+        self.assertEqual(devkit.decode_template_repo(description), 'git@github.com:o/app.git')
+        self.assertEqual(devkit.decode_template_repo('devkit%20template%20repo%3Dgit%40h%3Ao%2Fa.git%0A'), 'git@h:o/a.git')
+        self.assertIsNone(devkit.decode_template_repo(devkit.encode_template_description()))
+        self.assertIsNone(devkit.decode_template_repo(None))
+
+
+class FakeProxmox:
+
+    def __init__(self, containers):
+        self.state = {c['vmid']: dict(c) for c in containers}
+        self.calls = []
+
+    def containers(self):
+        return [dict(c) for c in self.state.values()]
+
+    def named(self, name):
+        return [c for c in self.containers() if c.get('name') == name]
+
+    def shutdown(self, vmid):
+        self.calls.append(('shutdown', vmid))
+
+    def to_template(self, vmid):
+        self.calls.append(('to_template', vmid))
+        self.state[vmid]['template'] = 1
+
+    def delete(self, vmid):
+        self.calls.append(('delete', vmid))
+        del self.state[vmid]
+
+    def set_config(self, vmid, **params):
+        self.calls.append(('rename', vmid))
+        self.state[vmid]['name'] = params['hostname']
+
+    def config(self, vmid):
+        return {'description': self.state[vmid].get('description', '')}
+
+
+class FakeRemote:
+
+    def run(self, script, stdin=None):
+        return ''
+
+
+class TestFreezing(unittest.TestCase):
+
+    def build(self, containers):
+        kit = devkit.Devkit.__new__(devkit.Devkit)
+        kit.proxmox = FakeProxmox(containers)
+        return kit
+
+    def setUp(self):
+        import contextlib
+        import unittest.mock
+        patcher = unittest.mock.patch.object(devkit, 'clone_lock', lambda wait_seconds=0: contextlib.nullcontext())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_the_old_template_goes_only_after_the_new_one_is_frozen(self):
+        kit = self.build([
+            {'vmid': 104, 'name': 'devkit-base', 'template': 1},
+            {'vmid': 110, 'name': 'devkit-build-base', 'template': 0},
+        ])
+        kit._freeze(110, FakeRemote(), 'devkit-base')
+        order = [name for name, _ in kit.proxmox.calls]
+        self.assertLess(order.index('to_template'), order.index('delete'))
+        self.assertLess(order.index('delete'), order.index('rename'))
+        self.assertEqual(kit.proxmox.containers(), [{'vmid': 110, 'name': 'devkit-base', 'template': 1}])
+
+    def test_a_first_build_has_nothing_to_replace(self):
+        kit = self.build([{'vmid': 110, 'name': 'devkit-build-base', 'template': 0}])
+        kit._freeze(110, FakeRemote(), 'devkit-base')
+        self.assertNotIn('delete', [name for name, _ in kit.proxmox.calls])
+
+    def test_a_build_interrupted_after_freezing_is_finished_by_the_next_one(self):
+        kit = self.build([{'vmid': 110, 'name': 'devkit-build-base', 'template': 1}])
+        kit._recover_or_discard('devkit-build-base', 'devkit-base')
+        self.assertEqual(kit.proxmox.containers(), [{'vmid': 110, 'name': 'devkit-base', 'template': 1}])
+
+    def test_a_stale_frozen_build_is_dropped_when_the_real_template_exists(self):
+        kit = self.build([
+            {'vmid': 104, 'name': 'devkit-base', 'template': 1},
+            {'vmid': 110, 'name': 'devkit-build-base', 'template': 1},
+        ])
+        kit._recover_or_discard('devkit-build-base', 'devkit-base')
+        self.assertEqual([c['vmid'] for c in kit.proxmox.containers()], [104])
+
+    def test_a_template_built_for_another_repository_is_refused(self):
+        kit = self.build([{'vmid': 111, 'name': 'devkit-tpl-app', 'template': 1,
+                           'description': devkit.encode_template_description('git@h:other/app.git')}])
+        kit.project = {'repo': 'git@h:mine/app.git'}
+        with self.assertRaises(devkit.DevkitError):
+            kit._require_same_repo(111, 'devkit-tpl-app')
+        kit.project = {'repo': 'git@h:other/app.git'}
+        kit._require_same_repo(111, 'devkit-tpl-app')
+
+    def test_fresh_only_makes_sense_for_the_base(self):
+        kit = self.build([])
+        kit.project = {'repo': 'x'}
+        kit.slug = 'app'
+        with self.assertRaises(devkit.DevkitError):
+            kit.template_build(base=False, fresh=True)
+
+    def test_only_unfrozen_build_containers_count_as_leftovers(self):
+        kit = self.build([
+            {'vmid': 104, 'name': 'devkit-base', 'template': 1},
+            {'vmid': 105, 'name': 'devkit-build-tpl-app', 'template': 0},
+            {'vmid': 106, 'name': 'devkit-build-base', 'template': 1},
+            {'vmid': 107, 'name': 'env-fix', 'template': 0},
+        ])
+        self.assertEqual([c['vmid'] for c in kit._leftover_builds()], [105])
+
+    def test_a_project_named_base_does_not_share_the_base_build_container(self):
+        self.assertNotEqual(devkit.BUILD_PREFIX + 'tpl-' + 'base', devkit.BUILD_PREFIX + 'base')
+
 
 
 class TestNames(unittest.TestCase):
