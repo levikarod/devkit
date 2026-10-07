@@ -1,9 +1,23 @@
 # devkit
 
-Disposable development environments. Each one is a Proxmox container cloned from a template, with Docker and Claude Code inside, your branch checked out, and the app's settings pushed in. Create one in about ten seconds, work in it, destroy it.
+Disposable development environments on Proxmox, with Docker and Claude Code inside.
 
-- What is planned: [ROADMAP.md](ROADMAP.md)
-- How the template is built: [TEMPLATE.md](TEMPLATE.md)
+## Quick start
+
+```bash
+python3 ~/devkit/devkit.py setup    # once per machine; repeat until it says everything is in place
+cd <project> && devkit setup        # once per project that has a .devkit.toml
+
+devkit create fix-orders            # an environment on branch fix-orders, ready in about 15 seconds
+devkit code fix-orders              # open it in VS Code
+devkit claude fix-orders            # or work in it with Claude Code
+devkit task fix-orders "<brief>"    # or hand a task to a Claude worker inside
+devkit destroy fix-orders           # refuses if work inside would be lost
+```
+
+- A project needs a `.devkit.toml`: see [Project config](#project-config-repodevkittoml), or ask Claude to use the `setting-up-devkit` skill.
+- The server needs a template: see [TEMPLATE.md](TEMPLATE.md).
+- What is planned: [ROADMAP.md](ROADMAP.md).
 
 ## Usage
 
