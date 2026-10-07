@@ -1021,10 +1021,259 @@ def step(message):
     print(f'  {message}', flush=True)
 
 
+REPO_ROOT = Path(__file__).resolve().parent
+COMMAND_LINK = Path('~/.local/bin/devkit').expanduser()
+CLAUDE_SETTINGS = CLAUDE_HOME / 'settings.json'
+PERMITTED_COMMANDS = ('create', 'list', 'check', 'task', 'report', 'ssh', 'claude', 'code', 'stop', 'start')
+REQUIRED_SERVER_KEYS = (
+    ('proxmox', 'host'), ('proxmox', 'node'), ('proxmox', 'pool'), ('proxmox', 'template'),
+    ('limits', 'max_environments'),
+    ('ssh', 'user'), ('ssh', 'key'), ('ssh', 'github_key'),
+    ('secrets', 'file'), ('secrets', 'proxmox_token_key'),
+)
+SERVER_CONFIG_TEMPLATE = '''[proxmox]
+host = ""
+node = ""
+pool = "devkit"
+template = 0
+
+[limits]
+max_environments = 3
+min_free_memory_mb = 2048
+
+[ssh]
+user = "dev"
+key = "~/.ssh/devkit_ed25519"
+github_key = "~/.ssh/id_ed25519"
+authorize = "~/.ssh/authorized_keys"
+
+[secrets]
+file = ""
+proxmox_token_key = "PVEAPIToken"
+claude_token_key = "CLAUDE_CODE_OAUTH_TOKEN"
+
+[variables]
+shared_host = ""
+'''
+
+
+def permission_rules():
+    return [f'Bash(devkit {command}:*)' for command in PERMITTED_COMMANDS]
+
+
+def add_permission_rules(settings, rules):
+    allow = settings.setdefault('permissions', {}).setdefault('allow', [])
+    added = [rule for rule in rules if rule not in allow]
+    allow.extend(added)
+    return added
+
+
+def remove_permission_rules(settings, rules):
+    allow = settings.get('permissions', {}).get('allow', [])
+    removed = [rule for rule in allow if rule in rules]
+    if removed:
+        kept = [rule for rule in allow if rule not in rules]
+        if kept:
+            settings['permissions']['allow'] = kept
+        else:
+            del settings['permissions']['allow']
+    return removed
+
+
+def read_settings(path):
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
+def write_settings(path, settings):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(settings, indent=2, ensure_ascii=False) + '\n')
+
+
+def missing_server_keys(config):
+    return [
+        f'[{section}] {key}' for section, key in REQUIRED_SERVER_KEYS
+        if config.get(section, {}).get(key) in (None, '', 0)
+    ]
+
+
+class Setup:
+
+    def __init__(self, project_dir):
+        self.pending = 0
+        try:
+            self.project_root = find_project_config(project_dir).parent
+        except DevkitError:
+            self.project_root = None
+
+    def ok(self, item, detail=''):
+        print(f'  ok        {item}' + (f': {detail}' if detail else ''))
+
+    def done(self, item, detail):
+        print(f'  done      {item}: {detail}')
+
+    def needs_you(self, item, detail):
+        self.pending += 1
+        print(f'  NEEDS YOU {item}: {detail}')
+
+    def run(self):
+        print('devkit setup')
+        self.command_link()
+        self.skills()
+        self.permissions()
+        server = self.server_config()
+        if server:
+            self.ssh_keys(server)
+            self.secrets_and_proxmox(server)
+        print()
+        if self.pending:
+            print(f'{self.pending} item(s) need you; run `devkit setup` again afterwards')
+            return 1
+        print('everything is in place')
+        return 0
+
+    def link(self, item, link, target):
+        if link.is_symlink() and link.resolve() == target.resolve():
+            self.ok(item)
+            return
+        if link.exists() or link.is_symlink():
+            self.needs_you(item, f'{link} exists and is not a link to {target}; remove it and run setup again')
+            return
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(target)
+        self.done(item, f'linked {link} -> {target}')
+
+    def command_link(self):
+        self.link('devkit command', COMMAND_LINK, REPO_ROOT / 'devkit.py')
+        if str(COMMAND_LINK.parent) not in os.environ.get('PATH', '').split(os.pathsep):
+            self.needs_you('PATH', f'{COMMAND_LINK.parent} is not on your PATH')
+
+    def skills(self):
+        for skill in sorted((REPO_ROOT / 'skills').iterdir()):
+            if skill.is_dir():
+                self.link(f'skill {skill.name}', CLAUDE_HOME / 'skills' / skill.name, skill)
+
+    def permissions(self):
+        self.project_permissions()
+        self.machine_permissions()
+
+    def project_permissions(self):
+        item = 'Claude Code permissions'
+        if self.project_root is None:
+            print(f'  skipped   {item}: no {PROJECT_CONFIG_NAME} here; '
+                  'run `devkit setup` inside a project to allow devkit there')
+            return
+        path = self.project_root / '.claude' / 'settings.json'
+        try:
+            settings = read_settings(path)
+        except ValueError:
+            self.needs_you(item, f'{path} is not valid JSON; fix it and run setup again')
+            return
+        added = add_permission_rules(settings, permission_rules())
+        if not added:
+            self.ok(item, f'{len(PERMITTED_COMMANDS)} devkit commands allowed in {self.project_root.name}; '
+                          'destroy and ship still ask')
+            return
+        write_settings(path, settings)
+        self.done(item, f'allowed {len(added)} command(s) in {path}')
+        for rule in added:
+            print(f'              {rule}')
+        print('              not allowed on purpose: devkit destroy, devkit ship')
+        print('              this file belongs to the project: review and commit it')
+        print('              restart Claude Code sessions to pick this up')
+
+    def machine_permissions(self):
+        item = 'machine-wide permissions'
+        try:
+            settings = read_settings(CLAUDE_SETTINGS)
+        except ValueError:
+            return
+        removed = remove_permission_rules(settings, permission_rules())
+        if not removed:
+            return
+        backup = CLAUDE_SETTINGS.with_name(CLAUDE_SETTINGS.name + '.before-devkit')
+        backup.write_text(CLAUDE_SETTINGS.read_text())
+        write_settings(CLAUDE_SETTINGS, settings)
+        self.done(item, f'removed {len(removed)} devkit rule(s) from {CLAUDE_SETTINGS}; '
+                        'permissions are per project now')
+
+    def server_config(self):
+        item = 'server config'
+        if not SERVER_CONFIG.exists():
+            SERVER_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+            SERVER_CONFIG.write_text(SERVER_CONFIG_TEMPLATE)
+            self.needs_you(item, f'wrote a blank {SERVER_CONFIG}; fill it in (see README, "Server config")')
+            return None
+        try:
+            server = load_toml(SERVER_CONFIG)
+        except tomllib.TOMLDecodeError as error:
+            self.needs_you(item, f'{SERVER_CONFIG} does not parse: {error}')
+            return None
+        missing = missing_server_keys(server)
+        if missing:
+            self.needs_you(item, f'{SERVER_CONFIG} is missing ' + ', '.join(missing))
+            return None
+        self.ok(item, str(SERVER_CONFIG))
+        return server
+
+    def ssh_keys(self, server):
+        key = Path(server['ssh']['key']).expanduser()
+        if key.exists():
+            self.ok('environment SSH key')
+        else:
+            key.parent.mkdir(parents=True, exist_ok=True)
+            subprocess.run(
+                ['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-C', 'devkit', '-f', str(key)], check=True,
+            )
+            self.needs_you(
+                'environment SSH key',
+                f'created {key}; its public half must be in the template (see TEMPLATE.md)',
+            )
+        github_key = Path(server['ssh']['github_key']).expanduser()
+        if github_key.exists():
+            self.ok('GitHub SSH key')
+        else:
+            self.needs_you('GitHub SSH key', f'{github_key} does not exist')
+
+    def secrets_and_proxmox(self, server):
+        secrets = server['secrets']
+        path = Path(secrets['file']).expanduser()
+        if not path.is_file():
+            self.needs_you('secrets file', f'{path} does not exist')
+            return
+        text = path.read_text()
+        token = read_env_value(text, secrets['proxmox_token_key'])
+        if not token:
+            self.needs_you('Proxmox token', f"{secrets['proxmox_token_key']} is not set in {path}")
+            return
+        claude_key = secrets.get('claude_token_key')
+        if claude_key and read_env_value(text, claude_key):
+            self.ok('Claude token')
+        else:
+            self.needs_you(
+                'Claude token',
+                f'run `claude setup-token` and put the result in {path} as {claude_key or "CLAUDE_CODE_OAUTH_TOKEN"}',
+            )
+        try:
+            containers = Proxmox(server['proxmox'], token).containers()
+        except DevkitError as error:
+            self.needs_you('Proxmox access', str(error))
+            return
+        self.ok('Proxmox access')
+        template = server['proxmox']['template']
+        match = [c for c in containers if int(c['vmid']) == int(template)]
+        if match and match[0].get('template'):
+            self.ok('template', f"container {template} ({match[0].get('name', '')})")
+        elif match:
+            self.needs_you('template', f'container {template} exists but is not a template')
+        else:
+            self.needs_you('template', f'container {template} is not visible to the token; build one (see TEMPLATE.md)')
+
+
 def build_parser():
     parser = argparse.ArgumentParser(prog='devkit', description='Disposable development environments')
     parser.add_argument('-C', dest='project_dir', default='.', help='project folder holding .devkit.toml')
     commands = parser.add_subparsers(dest='command', required=True)
+    commands.add_parser('setup', help='install devkit on this machine and report what is missing')
     create = commands.add_parser('create', help='create an environment')
     create.add_argument('name')
     create.add_argument('branch', nargs='?', help='defaults to the name')
@@ -1072,6 +1321,8 @@ def strip_separator(arguments):
 def main(argv=None):
     arguments = build_parser().parse_args(argv)
     try:
+        if arguments.command == 'setup':
+            return Setup(Path(arguments.project_dir).resolve()).run()
         devkit = Devkit(Path(arguments.project_dir).resolve())
         if arguments.command == 'create':
             devkit.create(arguments.name, arguments.branch, check=not arguments.no_check)

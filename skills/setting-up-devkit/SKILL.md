@@ -134,6 +134,10 @@ Only services that accept a key in a request header fit. Browser-login-only serv
 - Use a key made for environments, separate from any automation key, with the narrowest scopes that work. PostHog's server rejects keys lacking `user:read`.
 - List only what work inside an environment needs.
 
+## Permissions
+
+Writing `.devkit.toml` does not let Claude sessions run devkit in this project. That takes allow rules in the project's `.claude/settings.json`, and a Claude session may not add them itself. When the file is done, tell the user to run `devkit setup` from the project folder, then review and commit the settings change.
+
 ## Verify
 
 ```bash

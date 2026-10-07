@@ -80,12 +80,27 @@ If a step fails, the half-made environment is removed.
 ### Install
 
 ```bash
-ln -s ~/devkit/devkit.py ~/.local/bin/devkit
-ln -s ~/devkit/skills/setting-up-devkit ~/.claude/skills/setting-up-devkit
-ln -s ~/devkit/skills/delegating-to-devkit-workers ~/.claude/skills/delegating-to-devkit-workers
+python3 ~/devkit/devkit.py setup      # first time, anywhere: installs the machine parts
+cd <project> && devkit setup           # in each project that has a .devkit.toml
 ```
 
-Python 3.11 or newer. No dependencies.
+Run it yourself, in a terminal. It installs what it can and tells you what is left; run it again until it says everything is in place. It is safe to repeat.
+
+| It checks | And, when missing |
+|---|---|
+| the `devkit` command on your PATH | links it |
+| the two skills in `~/.claude/skills` | links them |
+| Claude Code permission to run devkit, per project | adds allow rules to the project's `.claude/settings.json`; review and commit that file |
+| the server config | writes a blank one for you to fill in |
+| the SSH keys, the secrets file, the Claude token | says which is missing |
+| Proxmox access and the template | says what is wrong |
+
+- The permission rules cover `create`, `list`, `check`, `task`, `report`, `ssh`, `claude`, `code`, `stop` and `start`. `destroy` and `ship` are left out on purpose, so Claude Code still reviews them.
+- Permissions are per project, next to the `.devkit.toml` that makes them meaningful: sessions working in that project may create environments, sessions elsewhere may not. Outside a project, setup skips this step and says so.
+- Machine-wide devkit rules left by an earlier version are removed from `~/.claude/settings.json`, with a backup.
+- Without those rules, Claude Code's auto mode refuses devkit commands from Claude sessions and subagents.
+- A Claude session cannot run `setup` for you: changing its own permissions is refused. That is the point of the step being yours.
+- Python 3.11 or newer. No dependencies.
 
 ### Server config: `~/.config/devkit/config.toml`
 

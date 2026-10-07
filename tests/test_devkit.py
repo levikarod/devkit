@@ -272,6 +272,68 @@ class TestWorkers(unittest.TestCase):
         self.assertIn('--resume abc-123', script)
 
 
+class TestSetup(unittest.TestCase):
+
+    def test_rules_are_added_next_to_existing_ones(self):
+        settings = {'permissions': {'defaultMode': 'auto', 'allow': ['Bash(npm test)']}, 'model': 'opus'}
+        added = devkit.add_permission_rules(settings, devkit.permission_rules())
+        self.assertEqual(len(added), len(devkit.PERMITTED_COMMANDS))
+        self.assertEqual(settings['permissions']['allow'][0], 'Bash(npm test)')
+        self.assertEqual(settings['permissions']['defaultMode'], 'auto')
+        self.assertEqual(settings['model'], 'opus')
+        self.assertIn('Bash(devkit create:*)', settings['permissions']['allow'])
+
+    def test_a_second_run_adds_nothing(self):
+        settings = {}
+        devkit.add_permission_rules(settings, devkit.permission_rules())
+        self.assertEqual(devkit.add_permission_rules(settings, devkit.permission_rules()), [])
+        self.assertEqual(len(settings['permissions']['allow']), len(devkit.PERMITTED_COMMANDS))
+
+    def test_only_devkit_rules_are_removed(self):
+        settings = {'permissions': {'defaultMode': 'auto', 'allow': ['Bash(npm test)']}}
+        devkit.add_permission_rules(settings, devkit.permission_rules())
+        removed = devkit.remove_permission_rules(settings, devkit.permission_rules())
+        self.assertEqual(len(removed), len(devkit.PERMITTED_COMMANDS))
+        self.assertEqual(settings, {'permissions': {'defaultMode': 'auto', 'allow': ['Bash(npm test)']}})
+
+    def test_an_emptied_allow_list_is_dropped_and_nothing_else(self):
+        settings = {'permissions': {'defaultMode': 'auto'}, 'model': 'opus'}
+        devkit.add_permission_rules(settings, devkit.permission_rules())
+        devkit.remove_permission_rules(settings, devkit.permission_rules())
+        self.assertEqual(settings, {'permissions': {'defaultMode': 'auto'}, 'model': 'opus'})
+
+    def test_removing_from_settings_without_rules_changes_nothing(self):
+        settings = {'model': 'opus'}
+        self.assertEqual(devkit.remove_permission_rules(settings, devkit.permission_rules()), [])
+        self.assertEqual(settings, {'model': 'opus'})
+
+    def test_commands_that_can_lose_or_publish_work_are_never_pre_approved(self):
+        rules = ' '.join(devkit.permission_rules())
+        for command in ('destroy', 'ship', 'setup'):
+            self.assertNotIn(f'devkit {command}', rules)
+
+    def test_every_permitted_command_exists(self):
+        choices = devkit.build_parser()._subparsers._group_actions[0].choices
+        for command in devkit.PERMITTED_COMMANDS:
+            self.assertIn(command, choices)
+
+    def test_blank_server_config_reports_every_required_key(self):
+        import tomllib
+        missing = devkit.missing_server_keys(tomllib.loads(devkit.SERVER_CONFIG_TEMPLATE))
+        self.assertEqual(missing, [
+            '[proxmox] host', '[proxmox] node', '[proxmox] template', '[secrets] file',
+        ])
+
+    def test_a_complete_server_config_reports_nothing(self):
+        config = {
+            'proxmox': {'host': 'h', 'node': 'n', 'pool': 'p', 'template': 105},
+            'limits': {'max_environments': 3},
+            'ssh': {'user': 'dev', 'key': 'k', 'github_key': 'g'},
+            'secrets': {'file': 'f', 'proxmox_token_key': 'T'},
+        }
+        self.assertEqual(devkit.missing_server_keys(config), [])
+
+
 class TestNames(unittest.TestCase):
 
     def test_accepts_branch_like_names(self):

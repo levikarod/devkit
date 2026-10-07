@@ -11,6 +11,8 @@ devkit creates disposable environments: a machine with the project checked out o
 
 **This skill does not apply inside an environment.** If `devkit` is not on the PATH, or the project folder has a `CLAUDE.local.md` that starts with "Devkit environment", you are a worker: do the task you were given and report. You cannot create or destroy environments.
 
+**If a devkit command is refused by a permission check, stop.** Do not retry it, rephrase it, or reach the same result another way. Tell the user to run `devkit setup` themselves, in a terminal, from inside the project: it adds the permission rules to that project, and only they can.
+
 ## When to delegate
 
 | Situation | Do |
