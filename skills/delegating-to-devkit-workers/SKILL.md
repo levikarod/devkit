@@ -30,6 +30,7 @@ When the user asks for an environment by name ("do this in an environment", "eac
 devkit list                                   # what exists; the last line is "N of M environments"
 devkit create <name> [branch]                 # about 15s, plus about 35s comparing tool servers
 devkit create <name> --no-check               # skip that comparison when the task needs no tool server
+devkit create <name> --memory 8192            # a bigger environment, for heavy or long tests (several workers, scraping)
 devkit task <name> "<brief>"                  # blocks until the worker reports
 devkit task <name> --continue "<follow-up>"   # same worker session, keeps its context
 devkit report <name>                          # the last worker's report again, any time

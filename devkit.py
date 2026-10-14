@@ -215,6 +215,10 @@ def describe_work(work):
     return ' and '.join(parts)
 
 
+def memory_needed(floor, size):
+    return max(filter(None, (floor, size.get('memory'))), default=None)
+
+
 def free_memory_mb(node_status):
     memory = node_status['memory']
     return (memory['total'] - memory['used']) // 2**20
@@ -370,8 +374,9 @@ def blank_env(text):
     return '\n'.join(lines) + '\n'
 
 
-def environment_size(server, project):
-    merged = {**server.get('environment', {}), **(project or {}).get('environment', {})}
+def environment_size(server, project, asked=None):
+    chosen = {key: value for key, value in (asked or {}).items() if value}
+    merged = {**server.get('environment', {}), **(project or {}).get('environment', {}), **chosen}
     size = {}
     if merged.get('memory_mb'):
         size['memory'] = int(merged['memory_mb'])
@@ -781,18 +786,19 @@ class Devkit:
     def remote(self, vmid):
         return Remote(self.proxmox.address(vmid), self.user, self.key)
 
-    def create(self, name, branch, check=True):
+    def create(self, name, branch, check=True, memory_mb=None, cores=None):
         validate_name(name)
         branch = branch or name
+        size = environment_size(self.server, self.project, {'memory_mb': memory_mb, 'cores': cores})
         with clone_lock():
-            self._create(name, branch, check)
+            self._create(name, branch, check, size)
 
-    def _create(self, name, branch, check=True):
+    def _create(self, name, branch, check, size):
         existing = self.proxmox.environments()
         if any(c['name'] == ENV_PREFIX + name for c in existing):
             raise DevkitError(f"environment '{name}' already exists")
         self._require_room(existing)
-        self._require_memory()
+        self._require_memory(size)
         template, template_name = self._template_for_project()
         vmid = self.proxmox.next_id()
         started = time.time()
@@ -807,7 +813,6 @@ class Devkit:
         )
         try:
             self._apply_network(vmid)
-            size = environment_size(self.server, self.project)
             if size:
                 self.proxmox.set_config(vmid, **size)
             self.proxmox.start(vmid)
@@ -1193,8 +1198,8 @@ git log --oneline -1
                 f"limit of {limit} running environments reached ({', '.join(names)}); stop or destroy one first"
             )
 
-    def _require_memory(self):
-        needed = self.server['limits'].get('min_free_memory_mb')
+    def _require_memory(self, size=None):
+        needed = memory_needed(self.server['limits'].get('min_free_memory_mb'), size or {})
         if not needed:
             return
         free = free_memory_mb(self.proxmox.node_status())
@@ -1279,7 +1284,7 @@ git log --oneline -1
             print(f"'{name}' is already running")
             return
         self._require_room(self.proxmox.environments())
-        self._require_memory()
+        self._require_memory({'memory': container.get('maxmem', 0) // 2**20})
         self.proxmox.start(container['vmid'])
         remote = self.remote(container['vmid'])
         remote.wait()
@@ -1789,6 +1794,13 @@ class Setup:
             self.ok('template', name)
 
 
+def positive(text):
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError(f'{text} is not a positive number')
+    return value
+
+
 def build_parser():
     parser = argparse.ArgumentParser(prog='devkit', description='Disposable development environments')
     parser.add_argument('-C', dest='project_dir', default='.', help='project folder holding .devkit.toml')
@@ -1807,6 +1819,8 @@ def build_parser():
     create.add_argument('name')
     create.add_argument('branch', nargs='?', help='defaults to the name')
     create.add_argument('--no-check', action='store_true', help='skip the tool server comparison')
+    create.add_argument('--memory', type=positive, metavar='MB', help='memory for this environment, overriding [environment]')
+    create.add_argument('--cores', type=positive, help='CPU cores for this environment, overriding [environment]')
     check = commands.add_parser('check', help='compare tool servers here and inside an environment')
     check.add_argument('name')
     listing = commands.add_parser('list', help='list environments')
@@ -1861,7 +1875,8 @@ def main(argv=None):
             return devkit.template_build(base=arguments.base, fresh=arguments.fresh)
         devkit = Devkit(Path(arguments.project_dir).resolve())
         if arguments.command == 'create':
-            devkit.create(arguments.name, arguments.branch, check=not arguments.no_check)
+            devkit.create(arguments.name, arguments.branch, check=not arguments.no_check,
+                          memory_mb=arguments.memory, cores=arguments.cores)
         elif arguments.command == 'check':
             devkit.check(arguments.name)
         elif arguments.command == 'list':

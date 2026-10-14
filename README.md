@@ -32,6 +32,7 @@ Run from inside a project that has a `.devkit.toml` (or pass `-C <project folder
 ```bash
 devkit create fix-orders            # branch fix-orders; cut from the base branch if it is new
 devkit create review feature/x      # environment "review" on an existing branch
+devkit create scraper --memory 8192 --cores 4   # a bigger one, for this environment only
 devkit list                         # name, branch, address, state, memory, uptime
 devkit list --json                  # name, branch and state for scripts
 devkit ssh fix-orders               # shell in the project folder
@@ -60,7 +61,7 @@ Names are lowercase letters, digits and dashes, at most 30 characters.
 ### What `create` does
 
 1. Refuses if the environment cap is reached or another create is running.
-2. Clones the project's template, or the base when the project has none, starts it, waits for SSH. Applies the size from `[environment]` when one is set.
+2. Clones the project's template, or the base when the project has none, starts it, waits for SSH. Applies the size from `--memory` and `--cores`, else from `[environment]` when one is set. The environment's memory also has to be free on the server, at create and at `start`.
 3. Fetches the branch from the remote inside the environment.
 4. Pushes the app's settings file, rewritten as the project config says.
 5. Pushes the Claude token and tool server keys to a separate protected file.

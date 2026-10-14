@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 import devkit
 
@@ -239,6 +240,17 @@ class TestMemory(unittest.TestCase):
         status = {'memory': {'total': 24 * 2**30, 'used': 18 * 2**30, 'free': 1 * 2**30}}
         self.assertEqual(devkit.free_memory_mb(status), 6 * 1024)
 
+    def test_a_large_environment_needs_its_own_size_free(self):
+        self.assertEqual(devkit.memory_needed(2048, {'memory': 8192}), 8192)
+
+    def test_a_small_environment_still_needs_the_configured_floor(self):
+        self.assertEqual(devkit.memory_needed(2048, {'memory': 1024}), 2048)
+        self.assertEqual(devkit.memory_needed(2048, {}), 2048)
+
+    def test_without_a_floor_only_an_asked_size_is_checked(self):
+        self.assertEqual(devkit.memory_needed(None, {'memory': 8192}), 8192)
+        self.assertIsNone(devkit.memory_needed(None, {}))
+
 
 class TestWorkers(unittest.TestCase):
 
@@ -391,6 +403,22 @@ class TestTemplates(unittest.TestCase):
         self.assertEqual(devkit.environment_size(server, {'environment': {'memory_mb': 6144}}), {'memory': 6144, 'cores': 4})
         self.assertEqual(devkit.environment_size({}, {}), {})
         self.assertEqual(devkit.environment_size({}, None), {})
+
+    def test_a_size_asked_for_at_create_wins_over_both(self):
+        server = {'environment': {'memory_mb': 3072, 'cores': 4}}
+        project = {'environment': {'memory_mb': 6144}}
+        self.assertEqual(devkit.environment_size(server, project, {'memory_mb': 8192}), {'memory': 8192, 'cores': 4})
+        self.assertEqual(devkit.environment_size(server, project, {'cores': 2}), {'memory': 6144, 'cores': 2})
+
+    def test_a_size_left_unset_at_create_changes_nothing(self):
+        server = {'environment': {'memory_mb': 3072}}
+        self.assertEqual(devkit.environment_size(server, None, {'memory_mb': None, 'cores': None}), {'memory': 3072})
+
+    def test_create_takes_a_size(self):
+        arguments = devkit.build_parser().parse_args(['create', 'big', '--memory', '8192', '--cores', '2'])
+        self.assertEqual((arguments.memory, arguments.cores), (8192, 2))
+        arguments = devkit.build_parser().parse_args(['create', 'small'])
+        self.assertEqual((arguments.memory, arguments.cores), (None, None))
 
     def test_provisioning_is_for_the_configured_user_and_node(self):
         script = devkit.provision_script('builder', 20)
@@ -645,6 +673,44 @@ class TestRunningLimit(unittest.TestCase):
     def test_the_limit_is_reached_by_running_ones_only(self):
         self.assertIsNone(devkit.limit_reached(self.ENVIRONMENTS, 3))
         self.assertEqual(devkit.limit_reached(self.ENVIRONMENTS, 2), ['a', 'c'])
+
+
+class TestSizedEnvironments(unittest.TestCase):
+
+    def kit(self, free_mb=4096, server_size=None, project_size=None):
+        kit = devkit.Devkit.__new__(devkit.Devkit)
+        kit.server = {'limits': {'min_free_memory_mb': 2048}, 'environment': server_size or {}}
+        kit.project = {'environment': project_size or {}}
+        kit.proxmox = mock.MagicMock()
+        kit.proxmox.node_status.return_value = {'memory': {'total': free_mb * 2**20, 'used': 0}}
+        return kit
+
+    def test_create_hands_the_asked_size_to_the_clone(self):
+        kit = self.kit(server_size={'memory_mb': 3072, 'cores': 4})
+        with mock.patch.object(kit, '_create') as create, mock.patch.object(devkit, 'clone_lock'):
+            kit.create('big', None, memory_mb=8192)
+        self.assertEqual(create.call_args.args[3], {'memory': 8192, 'cores': 4})
+
+    def test_a_size_the_server_cannot_hold_is_refused(self):
+        with self.assertRaisesRegex(devkit.DevkitError, '8192 MB is required'):
+            self.kit(free_mb=4096)._require_memory({'memory': 8192})
+
+    def test_a_size_the_server_can_hold_is_allowed(self):
+        self.kit(free_mb=9000)._require_memory({'memory': 8192})
+
+    def test_starting_a_large_stopped_environment_needs_its_size_free(self):
+        kit = self.kit(free_mb=4096)
+        kit.proxmox.find.return_value = {'vmid': 104, 'status': 'stopped', 'maxmem': 8192 * 2**20}
+        kit.proxmox.environments.return_value = []
+        kit.server['limits']['max_environments'] = 4
+        with self.assertRaisesRegex(devkit.DevkitError, '8192 MB is required'):
+            kit.start('big')
+        kit.proxmox.start.assert_not_called()
+
+    def test_a_size_must_be_positive(self):
+        for flag in ('--memory', '--cores'):
+            with self.assertRaises(SystemExit), mock.patch('sys.stderr'):
+                devkit.build_parser().parse_args(['create', 'big', flag, '-1'])
 
 
 class TestWorkerTimeLimit(unittest.TestCase):
